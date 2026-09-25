@@ -412,7 +412,7 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             "order_not_fulfilled",
             89.0,
             order_id,
-            relevant_domains=("order", "payment", "seller"),
+            relevant_domains=("order", "payment", "item", "seller"),
         )
 
     if primary_claim == "late_delivery_seller":
@@ -427,7 +427,7 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             "refund_freight",
             18.0,
             order_id,
-            relevant_domains=("order", "shipment", "seller"),
+            relevant_domains=("order", "payment", "shipment", "seller"),
         )
 
     if primary_claim == "late_delivery_logistics":
@@ -442,7 +442,7 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             "refund_freight",
             16.0,
             order_id,
-            relevant_domains=("order", "shipment"),
+            relevant_domains=("order", "payment", "shipment"),
         )
 
     if primary_claim == "duplicate_charge":
@@ -532,7 +532,7 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             None,
             0.0,
             None,
-            relevant_domains=("order",),
+            relevant_domains=("order", "payment", "shipment"),
         )
 
     delay_owner = _shipment_delay(shipment_items, order_items, item_items)
@@ -548,7 +548,7 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             "refund_freight",
             18.0,
             order_id,
-            relevant_domains=("order", "shipment", "seller"),
+            relevant_domains=("order", "payment", "shipment", "seller"),
         )
     if delay_owner == "logistics":
         return Decision(
@@ -562,7 +562,7 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             "refund_freight",
             16.0,
             order_id,
-            relevant_domains=("order", "shipment"),
+            relevant_domains=("order", "payment", "shipment"),
         )
 
     return Decision(
@@ -576,7 +576,7 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
         None,
         0.0,
         None,
-        relevant_domains=("order",),
+        relevant_domains=("order", "payment", "shipment"),
     )
 
 
@@ -594,24 +594,35 @@ def build_data_conflicts(bundle: EvidenceBundle, primary_issue: str = "") -> lis
     return []
 
 
+CLAIM_TOPIC_DOMAINS: dict[str, tuple[str, ...]] = {
+    "canceled_order_paid": ("order", "payment"),
+    "unavailable_order_paid": ("order", "payment", "item", "seller"),
+    "late_delivery_seller": ("order", "shipment", "seller"),
+    "late_delivery_logistics": ("order", "shipment"),
+    "duplicate_charge": ("order", "payment"),
+    "payment_mismatch": ("order", "payment", "item"),
+    "refund_pending": ("order", "payment", "refund"),
+    "refund_failed": ("order", "payment", "refund"),
+    "valid_split_payment": ("order", "payment"),
+    "unsupported_claim": ("order", "payment", "shipment"),
+    "requested_full_refund": ("order", "payment"),
+}
+
+
 def build_claim_assessments(
     claims: list[dict[str, Any]], decision: Decision, bundle: EvidenceBundle
 ) -> list[dict[str, Any]]:
-    relevant_refs = bundle.refs_for(decision.relevant_domains)
     assessments = []
     for claim in claims:
         topic = claim.get("topic")
         claim_id = claim.get("claim_id")
         if topic == "unsupported_claim":
             verdict = "unsupported"
-            claim_refs = relevant_refs[:20]
         elif topic == decision.primary_issue:
             verdict = "supported"
-            claim_refs = relevant_refs[:20]
         elif topic == "requested_full_refund":
             if decision.primary_issue in {"canceled_order_paid", "unavailable_order_paid"}:
                 verdict = "supported"
-                claim_refs = relevant_refs[:20]
             elif decision.primary_issue in {
                 "late_delivery_seller",
                 "late_delivery_logistics",
@@ -619,16 +630,18 @@ def build_claim_assessments(
                 "payment_mismatch",
             }:
                 verdict = "partially_supported"
-                claim_refs = relevant_refs[:20]
             elif decision.primary_issue in {"refund_failed", "refund_pending"}:
                 verdict = "supported"
-                claim_refs = relevant_refs[:20]
             else:
                 verdict = "unsupported"
-                claim_refs = relevant_refs[:20]
         else:
             verdict = "unsupported"
-            claim_refs = relevant_refs[:20]
+
+        claim_domains = CLAIM_TOPIC_DOMAINS.get(topic) or decision.relevant_domains
+        claim_refs = bundle.refs_for(claim_domains)[:20]
+        if not claim_refs:
+            claim_refs = bundle.refs_for(decision.relevant_domains)[:20]
+
         assessments.append(
             {
                 "claim_id": claim_id,
