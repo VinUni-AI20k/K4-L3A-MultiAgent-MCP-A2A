@@ -57,14 +57,19 @@ class EvidenceGateway:
             raise ValueError(f"MCP tool {tool_name}: case_id is required for every call")
         payload = {"case_id": case_id, **arguments}
         result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        # The installed MCP SDK version names this `is_error` (snake_case);
+        # fall back to the wire-format `isError` in case of a different SDK.
+        is_error = getattr(result, "is_error", None)
+        if is_error is None:
+            is_error = getattr(result, "isError", False)
+        if is_error:
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
             raise RuntimeError(f"MCP tool {tool_name} failed: {message or 'unknown error'}")
-        evidence = getattr(result, "structuredContent", None)
+        evidence = getattr(result, "structured_content", None)
         if evidence is None:
-            evidence = getattr(result, "structured_content", None)
+            evidence = getattr(result, "structuredContent", None)
         if evidence is None:
             text_blocks = [block.text for block in result.content if getattr(block, "text", None)]
             if len(text_blocks) != 1:
