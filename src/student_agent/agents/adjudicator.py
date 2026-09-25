@@ -189,29 +189,43 @@ def _fallback(assessment: dict[str, Any] | None, ledger: EvidenceLedger) -> Deci
     )
 
 
+# Claim "requested_full_refund": mức đáp ứng theo loại giải quyết của policy.
+FULL_REFUND_VERDICT: dict[str, str] = {
+    "canceled_order_paid": "supported",  # issue_refund toàn bộ khoản đã trả
+    "unavailable_order_paid": "supported",
+    "refund_failed": "supported",  # retry_refund khoản hoàn đã yêu cầu
+    "late_delivery_seller": "partially_supported",  # chỉ hoàn phí ship
+    "late_delivery_logistics": "partially_supported",
+    "duplicate_charge": "partially_supported",  # chỉ hoàn khoản trùng
+    "payment_mismatch": "partially_supported",
+    "refund_pending": "partially_supported",  # hoàn tiền đang xử lý
+    "valid_split_payment": "unsupported",
+    "unsupported_claim": "unsupported",
+}
+
+
 def default_claim_assessments(
     claims: list[dict[str, Any]],
     decision: Decision,
     refund_brl: float,
 ) -> list[dict[str, Any]]:
-    """Claim assessment mặc định suy ra từ quyết định cuối — TV2 có thể ghi đè bằng
-    key ``claim_assessments`` trong kết quả của order agent."""
+    """Claim assessment suy ra từ quyết định cuối (dùng khi specialist không đánh giá)."""
     out: list[dict[str, Any]] = []
     issue, refs = decision.primary_issue, decision.evidence_refs
     for claim in claims[:5]:
         topic = claim.get("topic", "")
-        if issue == "insufficient_evidence":
-            verdict, conf = "insufficient_evidence", decision.confidence
+        conf = decision.confidence
+        if issue == "insufficient_evidence" or not refs:
+            verdict = "insufficient_evidence"
         elif topic == "requested_full_refund":
-            if decision.case_status != "action_required" or refund_brl <= 0:
+            verdict = FULL_REFUND_VERDICT.get(issue, "insufficient_evidence")
+            if verdict != "unsupported" and refund_brl <= 0 and issue != "refund_pending":
                 verdict = "unsupported"
-            else:
-                verdict = "supported"
-            conf = decision.confidence
+            conf = round(min(conf, 0.8), 2)
         elif topic == issue:
-            verdict, conf = "supported", decision.confidence
+            verdict = "supported"
         else:
-            verdict, conf = "unsupported", decision.confidence
+            verdict = "unsupported"
         out.append({
             "claim_id": claim["claim_id"],
             "verdict": verdict,

@@ -54,6 +54,8 @@ class EvidenceRecord:
     tool: str
     domain: str
     agent: str
+    data: Any = None
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass
@@ -62,10 +64,29 @@ class EvidenceLedger:
 
     case_id: str
     records: dict[str, EvidenceRecord] = field(default_factory=dict)
+    # (tool, tham số) đã gọi, kể cả lần lỗi — để coordinator chỉ gọi bù khi cần.
+    attempted: set[tuple[str, tuple[tuple[str, str], ...]]] = field(default_factory=set)
 
     def add(self, evidence: dict[str, Any], tool: str, agent: str) -> None:
         ref = evidence["evidence_ref"]
-        self.records.setdefault(ref, EvidenceRecord(ref, tool, evidence["domain"], agent))
+        self.records.setdefault(
+            ref,
+            EvidenceRecord(
+                ref,
+                tool,
+                evidence["domain"],
+                agent,
+                evidence.get("data"),
+                tuple(evidence.get("warnings") or ()),
+            ),
+        )
+
+    def by_tool(self) -> dict[str, EvidenceRecord]:
+        """Bản ghi đầu tiên của mỗi tool (thứ tự thu thập)."""
+        result: dict[str, EvidenceRecord] = {}
+        for record in self.records.values():
+            result.setdefault(record.tool, record)
+        return result
 
     def __contains__(self, ref: object) -> bool:
         return ref in self.records
@@ -81,6 +102,60 @@ class EvidenceLedger:
     def only_known(self, refs: list[str]) -> list[str]:
         """Bỏ ref không thuộc case này (chống hard gate provenance) và ref trùng."""
         return [ref for ref in dict.fromkeys(refs) if ref in self.records]
+
+
+async def call_with_retry(
+    gateway: Any, tool_name: str, case_id: str, **arguments: str
+) -> dict[str, Any]:
+    for attempt in range(1, MAX_TOOL_ATTEMPTS + 1):
+        try:
+            return await gateway.call(tool_name, case_id=case_id, **arguments)
+        except _RETRYABLE:
+            if attempt == MAX_TOOL_ATTEMPTS:
+                raise
+    raise AssertionError("unreachable")
+
+
+class RecordingGateway:
+    """Bọc EvidenceGateway cho agent KHÔNG kế thừa BaseAgent (code của các thành viên khác).
+
+    Mọi evidence trả về cho agent đều được ghi vào ledger của case, nên coordinator /
+    verifier biết chính xác ref nào là thật, thuộc domain nào — không cần sửa code agent.
+    Agent vẫn tự emit ``tool_result_consumed`` như code gốc của họ.
+    """
+
+    def __init__(self, inner: Any, ledger: EvidenceLedger, actor: str) -> None:
+        self._inner = inner
+        self._ledger = ledger
+        self.actor = actor
+
+    async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+        if case_id != self._ledger.case_id:
+            raise ValueError(f"{self.actor}: case_id {case_id} does not match ledger")
+        self._ledger.attempted.add((tool_name, tuple(sorted(arguments.items()))))
+        evidence = await call_with_retry(self._inner, tool_name, case_id, **arguments)
+        self._ledger.add(evidence, tool_name, self.actor)
+        return evidence
+
+    async def list_tools(self) -> list[str]:
+        return await self._inner.list_tools()
+
+
+class TraceTap:
+    """Bọc TraceWriter: ghi nhận ref nào đã có ``tool_result_consumed`` trong trace."""
+
+    def __init__(self, inner: TraceWriter) -> None:
+        self._inner = inner
+        self.consumed: set[str] = set()
+
+    def emit(self, **kwargs: Any) -> dict[str, Any]:
+        event = self._inner.emit(**kwargs)
+        if kwargs.get("event_type") == "tool_result_consumed":
+            self.consumed.update(kwargs.get("evidence_refs") or [])
+        return event
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
 
 
 class BaseAgent:
@@ -119,13 +194,9 @@ class BaseAgent:
         """
         if self.ledger is not None and self.ledger.case_id != case_id:
             raise ValueError(f"{self.name}: case_id {case_id} does not match ledger")
-        for attempt in range(1, MAX_TOOL_ATTEMPTS + 1):
-            try:
-                evidence = await self.gateway.call(tool_name, case_id=case_id, **kwargs)
-                break
-            except _RETRYABLE:
-                if attempt == MAX_TOOL_ATTEMPTS:
-                    raise
+        if self.ledger is not None:
+            self.ledger.attempted.add((tool_name, tuple(sorted(kwargs.items()))))
+        evidence = await call_with_retry(self.gateway, tool_name, case_id, **kwargs)
         if self.ledger is not None:
             self.ledger.add(evidence, tool_name, self.name)
         self.trace.emit(
