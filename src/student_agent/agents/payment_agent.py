@@ -17,13 +17,13 @@ DoD:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Any, Optional
+from typing import Any
 
 from ..mcp_gateway import EvidenceGateway
 from ..trace import TraceWriter
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -60,7 +60,7 @@ class RefundLine:
     """Một dòng chi tiết đề xuất hoàn tiền."""
     reason_code: str          # slug mô tả lý do: 'duplicate_charge', 'overcharge_mismatch', v.v.
     amount_brl: Decimal       # Số tiền (Decimal, 2 chữ số thập phân)
-    entity_id: Optional[str]  # ID giao dịch, đơn hàng, refund-id …
+    entity_id: str | None     # ID giao dịch, đơn hàng, refund-id …
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -81,8 +81,8 @@ class PaymentInvestigationResult:
     financial_resolution: dict[str, Any]
 
     # --- Classification ---
-    detected_issue: Optional[str]          # Một trong: valid_split_payment | payment_mismatch |
-                                           # duplicate_charge | refund_pending | refund_failed | None
+    detected_issue: str | None          # Một trong: valid_split_payment | payment_mismatch |
+                                        # duplicate_charge | refund_pending | refund_failed | None
     # --- Evidence refs để ghép vào evidence_refs ---
     evidence_refs: list[str]
 
@@ -102,8 +102,8 @@ class PaymentAgent:
 
     Workflow nội bộ:
       1. Gọi ``get_order_payments``  → lấy danh sách khoản thanh toán, số tiền, loại thẻ.
-      2. Gọi ``get_payment_timeline`` → kiểm tra timeline duyệt/từ chối, phát hiện double-charge.
-      3. Gọi ``get_refund_timeline``  → kiểm tra trạng thái hoàn tiền (pending / failed / completed).
+      2. Gọi ``get_payment_timeline`` → kiểm tra timeline duyệt/từ chối, double-charge.
+      3. Gọi ``get_refund_timeline``  → kiểm tra trạng thái hoàn tiền (pending/failed).
       4. Gọi ``_reconcile()``         → phân loại issue + tính financial_resolution.
     """
 
@@ -122,9 +122,11 @@ class PaymentAgent:
         case_id: str,
         order_id: str,
         gateway: EvidenceGateway,
-        trace: Optional[TraceWriter] = None,
-        expected_order_total: Optional[float | int | Decimal] = None,
-        order_status: Optional[str] = None,
+        trace: TraceWriter | None = None,
+        expected_order_total: float | int | Decimal | None = None,
+        order_status: str | None = None,
+        order_purchase_at: str | None = None,
+        opened_at: str | None = None,
     ) -> PaymentInvestigationResult:
         """Gọi 3 MCP tools, đối soát dòng tiền và trả kết quả tài chính.
 
@@ -135,8 +137,13 @@ class PaymentAgent:
             trace:                 TraceWriter (tuỳ chọn) để ghi audit log.
             expected_order_total:  Giá trị đơn hàng từ order-agent (dùng để đối chiếu mismatch).
             order_status:          Trạng thái đơn từ order-agent ('delivered', 'canceled', …).
+            order_purchase_at:     Thời điểm mua hàng (lấy từ get_order) để lọc bản ghi nhiễu.
+            opened_at:             Thời điểm mở case (lấy từ input case) để lọc bản ghi nhiễu.
         """
         evidence_refs: list[str] = []
+
+        # Xây hàm lọc thời gian nếu có đủ thông tin
+        in_window = _build_window(order_purchase_at, opened_at)
 
         # ── 1. get_order_payments ──────────────────────────────────────────
         pmts_ev = await gateway.call(
@@ -171,9 +178,14 @@ class PaymentAgent:
                 )
 
         # ── 3. get_refund_timeline ─────────────────────────────────────────
-        rtl_ev = await gateway.call(
-            "get_refund_timeline", case_id=case_id, order_id=order_id
-        )
+        # Tool báo lỗi khi đơn không có refund (~60/100 case), nên phải bọc try/except
+        try:
+            rtl_ev = await gateway.call(
+                "get_refund_timeline", case_id=case_id, order_id=order_id
+            )
+        except Exception:
+            rtl_ev = {"data": {"events": []}}
+
         rtl_ref = rtl_ev.get("evidence_ref", "")
         if rtl_ref:
             evidence_refs.append(rtl_ref)
@@ -187,17 +199,27 @@ class PaymentAgent:
                 )
 
         # ── 4. Chuẩn hóa dữ liệu từ MCP response ─────────────────────────
-        payments_raw  = self._extract_list(pmts_ev.get("data", []), "payments")
-        ptl_raw       = self._extract_list(ptl_ev.get("data", []), "timeline")
-        refunds_raw   = self._extract_list(rtl_ev.get("data", []), "refunds")
+        # get_order_payments trả list thẳng
+        payments_raw = self._extract_list(pmts_ev.get("data", []), "payments")
+
+        # get_payment_timeline trả dict với key "events"
+        ptl_events = self._extract_list(ptl_ev.get("data"), "events")
+
+        # get_refund_timeline trả dict với key "events"
+        refund_events = self._extract_list(rtl_ev.get("data"), "events")
+
+        # Lọc theo khoảng thời gian case để loại bỏ bản ghi nhiễu
+        if in_window is not None:
+            ptl_events = [e for e in ptl_events if in_window(e.get("event_at"))]
+            refund_events = [e for e in refund_events if in_window(e.get("event_at"))]
 
         # ── 5. Đối soát ───────────────────────────────────────────────────
         return self._reconcile(
             case_id=case_id,
             order_id=order_id,
             payments=payments_raw,
-            payment_timeline=ptl_raw,
-            refund_timeline=refunds_raw,
+            payment_events=ptl_events,
+            refund_events=refund_events,
             evidence_refs=evidence_refs,
             expected_order_total=expected_order_total,
             order_status=order_status,
@@ -213,17 +235,25 @@ class PaymentAgent:
         case_id: str,
         order_id: str,
         payments: list[dict[str, Any]],
-        payment_timeline: list[dict[str, Any]],
-        refund_timeline: list[dict[str, Any]],
+        payment_timeline: list[dict[str, Any]] | None = None,
+        refund_timeline: list[dict[str, Any]] | None = None,
+        payment_events: list[dict[str, Any]] | None = None,
+        refund_events: list[dict[str, Any]] | None = None,
         evidence_refs: list[str],
-        expected_order_total: Optional[float | int | Decimal] = None,
-        order_status: Optional[str] = None,
+        expected_order_total: float | int | Decimal | None = None,
+        order_status: str | None = None,
     ) -> PaymentInvestigationResult:
-        """Thuần logic đối soát – không gọi gateway, không có side-effect."""
+        """Thuần logic đối soát – không gọi gateway, không có side-effect.
 
-        # ── A. Tổng hợp thông tin thanh toán ──────────────────────────────
+        Hỗ trợ cả tên tham số cũ (payment_timeline/refund_timeline) và mới
+        (payment_events/refund_events) để tương thích với tests hiện tại.
+        """
+        # Chuẩn hóa: ưu tiên tham số mới, fallback về cũ
+        ptl_events = payment_events if payment_events is not None else (payment_timeline or [])
+        rfnd_events = refund_events if refund_events is not None else (refund_timeline or [])
+
+        # ── A. Tổng hợp thông tin thanh toán từ get_order_payments ──────────
         payment_references: list[str] = []
-        payment_items: list[dict[str, Any]] = []   # enriched items
         captured_total = Decimal("0.00")
 
         for p in payments:
@@ -235,25 +265,35 @@ class PaymentAgent:
             if ref and str(ref) not in payment_references:
                 payment_references.append(str(ref))
 
-            amount = _dec(p.get("payment_value") or p.get("amount") or 0)
+            # get_order_payments: trường tiền là payment_value
+            amount = _dec(p.get("payment_value") or p.get("amount_brl") or p.get("amount") or 0)
             captured_total += amount
-            payment_items.append({
-                "ref":   ref,
-                "amount": amount,
-                "type":  str(p.get("payment_type", "")).lower(),
-                "raw":   p,
-            })
 
-        # ── B. Tổng hợp refund timeline ────────────────────────────────────
+        # ── B. Phân tích payment timeline events ──────────────────────────
+        # Dùng events "captured" từ get_payment_timeline (key "amount_brl")
+        captured_events: list[dict[str, Any]] = [
+            e for e in ptl_events if e.get("event_type") == "captured"
+        ]
+        has_mismatch_event = any(
+            e.get("event_type") == "reconciliation_mismatch" for e in ptl_events
+        )
+
+        # Tính tổng captured từ timeline events
+        captured_from_events = _sum_dec(
+            [_dec(e.get("amount_brl") or e.get("amount") or 0) for e in captured_events]
+        )
+
+        # ── C. Phân tích refund events ─────────────────────────────────────
         pending_refunds:   list[dict[str, Any]] = []
         failed_refunds:    list[dict[str, Any]] = []
         completed_refunds: list[dict[str, Any]] = []
         refunded_total = Decimal("0.00")
 
-        for r in refund_timeline:
+        for r in rfnd_events:
             r_status = str(r.get("status", "")).lower()
-            r_amount = _dec(r.get("amount") or r.get("refund_amount") or 0)
-            r_id     = r.get("refund_id") or r.get("id") or order_id
+            # get_refund_timeline: trường tiền là amount_brl
+            r_amount = _dec(r.get("amount_brl") or r.get("amount") or r.get("refund_amount") or 0)
+            r_id = r.get("refund_id") or r.get("id") or order_id
 
             if r_status in {"pending", "processing", "in_progress", "submitted"}:
                 pending_refunds.append({"id": r_id, "amount": r_amount})
@@ -267,62 +307,89 @@ class PaymentAgent:
                     completed_refunds.append({"id": r_id, "amount": r_amount})
                     refunded_total += r_amount
 
-        # ── C. Sử dụng payment timeline để phát hiện double-charge ─────────
-        # Timeline event có thể chứa các event loại 'captured', 'approved' … cùng
-        # một giao dịch hoặc cùng một external_transaction_id → dấu hiệu duplicate.
+        # ── D. Phát hiện duplicate charge từ timeline events ───────────────
+        # Quy tắc: ≥ 2 lần "captured" cùng amount_brl, tổng > giá trị đơn → duplicate
+        # Nếu tổng = giá trị đơn → valid_split_payment
         duplicate_items: list[dict[str, Any]] = []
-        seen_ext_ids: set[str] = set()
-        for evt in payment_timeline:
-            evt_type = str(evt.get("event_type", evt.get("status", ""))).lower()
-            if evt_type not in {"captured", "approved", "settled"}:
-                continue
-            ext_id = str(evt.get("external_transaction_id") or evt.get("transaction_id") or "")
-            if ext_id and ext_id in seen_ext_ids:
-                # Phát hiện capture trùng từ timeline
-                dup_amount = _dec(evt.get("amount") or evt.get("payment_value") or 0)
-                ref_id = evt.get("payment_reference") or ext_id
-                duplicate_items.append({"ref": ref_id, "amount": dup_amount})
-            if ext_id:
-                seen_ext_ids.add(ext_id)
 
-        # Heuristic bổ sung: cùng payment_type + cùng amount + số lần > 1
-        if not duplicate_items:
+        if len(captured_events) >= 2:
+            # Nhóm các captured events theo amount_brl
+            amount_counts: Counter[Decimal] = Counter()
+            for evt in captured_events:
+                amt = _dec(evt.get("amount_brl") or evt.get("amount") or 0)
+                amount_counts[amt] += 1
+
+            # Nếu có ≥ 2 event cùng amount và tổng > giá trị đơn → duplicate
+            for amt, cnt in amount_counts.items():
+                if cnt >= 2:
+                    total_for_amt = amt * cnt
+                    exp = (
+                        _dec(expected_order_total)
+                        if expected_order_total is not None
+                        else None
+                    )
+                    # duplicate: tổng > expected, hoặc không biết expected
+                    if exp is None or total_for_amt > exp:
+                        # Lần đầu là hợp lệ, lần sau là duplicate
+                        for _ in range(cnt - 1):
+                            duplicate_items.append({"ref": order_id, "amount": amt})
+
+        # Fallback: phát hiện duplicate từ get_order_payments (tương thích test cũ)
+        if not duplicate_items and not captured_events:
             sig_map: dict[str, list[dict[str, Any]]] = {}
-            for item in payment_items:
-                sig = f"{item['type']}|{item['amount']}"
-                sig_map.setdefault(sig, []).append(item)
+            for p in payments:
+                p_type = str(p.get("payment_type", "")).lower()
+                amount = _dec(p.get("payment_value") or p.get("amount_brl") or p.get("amount") or 0)
+                ref = p.get("payment_reference") or p.get("payment_id") or order_id
+                sig = f"{p_type}|{amount}"
+                sig_map.setdefault(sig, []).append({"ref": ref, "amount": amount, "raw": p})
 
-            for sig, items in sig_map.items():
+            for _, items in sig_map.items():
                 if len(items) <= 1:
                     continue
-                p_type = items[0]["type"]
+                p_type = str(items[0]["raw"].get("payment_type", "")).lower()
                 amount = items[0]["amount"]
-                exp    = _dec(expected_order_total) if expected_order_total is not None else None
+                exp = _dec(expected_order_total) if expected_order_total is not None else None
                 # credit_card trùng amount bằng đúng expected → rõ ràng là duplicate charge
                 if p_type == "credit_card" and (exp is None or amount == exp):
                     for extra in items[1:]:
                         duplicate_items.append({"ref": extra["ref"], "amount": extra["amount"]})
                 # Hoặc bất kỳ payment_type nào bị đánh dấu is_duplicate
                 for item in items[1:]:
-                    if item["raw"].get("is_duplicate") or item["raw"].get("status") == "duplicate":
+                    is_dup_flag = (
+                        item["raw"].get("is_duplicate")
+                        or item["raw"].get("status") == "duplicate"
+                    )
+                    if is_dup_flag and not any(
+                        d["ref"] == item["ref"] for d in duplicate_items
+                    ):
                         duplicate_items.append({"ref": item["ref"], "amount": item["amount"]})
 
-        # ── D. Phân loại sự cố và xây refund_lines ─────────────────────────
-        expected_total = _dec(expected_order_total) if expected_order_total is not None else None
-        detected_issue: Optional[str] = None
+        # Phát hiện duplicate từ payment timeline cũ (external_transaction_id)
+        if not duplicate_items:
+            seen_ext_ids: set[str] = set()
+            for evt in ptl_events:
+                evt_type = str(evt.get("event_type", evt.get("status", ""))).lower()
+                if evt_type not in {"captured", "approved", "settled"}:
+                    continue
+                ext_id = str(
+                    evt.get("external_transaction_id") or evt.get("transaction_id") or ""
+                )
+                if ext_id and ext_id in seen_ext_ids:
+                    dup_amount = _dec(
+                        evt.get("amount_brl") or evt.get("amount") or 0
+                    )
+                    ref_id = evt.get("payment_reference") or ext_id
+                    duplicate_items.append({"ref": ref_id, "amount": dup_amount})
+                if ext_id:
+                    seen_ext_ids.add(ext_id)
+
+        # ── E. Phân loại sự cố và xây refund_lines ─────────────────────────
+        # Thứ tự ưu tiên: refund_failed > refund_pending > duplicate > mismatch > split > ok
+        detected_issue: str | None = None
         refund_lines: list[RefundLine] = []
 
-        # Ưu tiên phân loại: duplicate > failed > pending > mismatch > split > ok
-        if duplicate_items:
-            detected_issue = "duplicate_charge"
-            for dup in duplicate_items:
-                refund_lines.append(RefundLine(
-                    reason_code="duplicate_charge",
-                    amount_brl=dup["amount"],
-                    entity_id=str(dup["ref"]) if dup["ref"] else order_id,
-                ))
-
-        elif failed_refunds:
+        if failed_refunds:
             detected_issue = "refund_failed"
             for fr in failed_refunds:
                 refund_lines.append(RefundLine(
@@ -340,22 +407,50 @@ class PaymentAgent:
                     entity_id=str(pr["id"]),
                 ))
 
-        elif expected_total is not None and captured_total != expected_total:
+        elif duplicate_items:
+            detected_issue = "duplicate_charge"
+            for dup in duplicate_items:
+                refund_lines.append(RefundLine(
+                    reason_code="duplicate_charge",
+                    amount_brl=dup["amount"],
+                    entity_id=str(dup["ref"]) if dup["ref"] else order_id,
+                ))
+
+        elif has_mismatch_event:
+            # Dùng event reconciliation_mismatch từ timeline thay vì so sánh captured_total
+            detected_issue = "payment_mismatch"
+            # Tính chênh lệch nếu có thể, fallback về captured từ events
+            expected_total = (
+                _dec(expected_order_total) if expected_order_total is not None else None
+            )
+            if expected_total is not None and captured_from_events > Decimal("0.00"):
+                diff = captured_from_events - expected_total
+                if diff > Decimal("0.00"):
+                    refund_lines.append(RefundLine(
+                        reason_code="overcharge_mismatch",
+                        amount_brl=diff,
+                        entity_id=order_id,
+                    ))
+            # Nếu không tính được chênh lệch, không thêm refund line (verifier sẽ xử lý)
+
+        elif not has_mismatch_event and expected_order_total is not None:
+            # Fallback: so captured_total (từ get_order_payments) vs expected
+            expected_total = _dec(expected_order_total)
             diff = captured_total - expected_total
-            if diff > Decimal("0.00"):
+            if diff > Decimal("0.01"):
                 detected_issue = "payment_mismatch"
                 refund_lines.append(RefundLine(
                     reason_code="overcharge_mismatch",
                     amount_brl=diff,
                     entity_id=order_id,
                 ))
-            # diff < 0 → underpayment: không hoàn, để coordinator / policy agent xử lý
+            elif len(payments) > 1 and captured_total == expected_total or len(payments) > 1:
+                detected_issue = "valid_split_payment"
 
-        elif len(payment_items) > 1 and (expected_total is None or captured_total == expected_total):
+        elif len(payments) > 1:
             detected_issue = "valid_split_payment"
-            # Split payment hợp lệ → refund_lines rỗng
 
-        # ── E. Xử lý đơn bị hủy / không khả dụng ─────────────────────────
+        # ── F. Xử lý đơn bị hủy / không khả dụng ─────────────────────────
         if order_status in {"canceled", "unavailable"}:
             remaining = max(Decimal("0.00"), captured_total - refunded_total)
             if remaining > Decimal("0.00") and not refund_lines:
@@ -366,21 +461,20 @@ class PaymentAgent:
                     entity_id=order_id,
                 ))
 
-        # ── F. Tính toán chính xác tổng hoàn tiền (Decimal, tránh float error) ──
+        # ── G. Tính toán chính xác tổng hoàn tiền (Decimal, tránh float error) ──
         recommended_dec = _sum_dec([line.amount_brl for line in refund_lines])
 
-        # ── G. Serialise refund_lines (float) ─────────────────────────────
+        # ── H. Serialise refund_lines (float) ─────────────────────────────
         serialised_lines = [line.to_dict() for line in refund_lines]
 
-        # ── H. DoD assertion (fail-fast trong dev, bảo toàn trong prod) ───
-        # sum(line["amount_brl"] for line in serialised_lines) == recommended_refund_brl
-        # Dùng Decimal để so sánh chính xác
-        _check = _sum_dec([_dec(l["amount_brl"]) for l in serialised_lines])
-        assert _check == recommended_dec, (
-            f"DoD violated: sum(refund_lines)={_check} != recommended={recommended_dec}"
-        )
+        # ── I. DoD check (dùng raise thay vì assert để không bị tắt với -O) ──
+        _check = _sum_dec([_dec(ln["amount_brl"]) for ln in serialised_lines])
+        if _check != recommended_dec:
+            raise ValueError(
+                f"DoD violated: sum(refund_lines)={_check} != recommended={recommended_dec}"
+            )
 
-        # ── I. Xác định giao dịch có hợp lệ không ─────────────────────────
+        # ── J. Xác định giao dịch có hợp lệ không ─────────────────────────
         is_valid = (
             detected_issue in {None, "valid_split_payment"}
             and recommended_dec == Decimal("0.00")
@@ -423,3 +517,31 @@ class PaymentAgent:
             # dict đơn → đóng gói thành list
             return [data]
         return []
+
+
+# ---------------------------------------------------------------------------
+# Utility: xây hàm lọc thời gian
+# ---------------------------------------------------------------------------
+
+def _build_window(
+    order_purchase_at: str | None,
+    opened_at: str | None,
+):
+    """Trả về hàm in_window(value) hoặc None nếu thiếu thông tin."""
+    if not order_purchase_at or not opened_at:
+        return None
+    try:
+        from ..agents.evidence_rules import WINDOW_SLACK, parse_ts  # type: ignore[import]
+        start = parse_ts(order_purchase_at)
+        end = parse_ts(opened_at)
+        if start is None or end is None:
+            return None
+        start = start - WINDOW_SLACK
+
+        def in_window(value: str | None) -> bool:
+            ts = parse_ts(value)
+            return ts is not None and start <= ts <= end
+
+        return in_window
+    except Exception:
+        return None

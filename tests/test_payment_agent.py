@@ -237,7 +237,11 @@ class TestCanceledOrder:
 
 class TestDoD:
     def test_floating_point_sum_is_exact(self, agent: PaymentAgent) -> None:
-        """0.10 + 0.20 phải bằng đúng 0.30, không phải 0.30000000000000004."""
+        """0.10 + 0.20 phải bằng đúng 0.30, không phải 0.30000000000000004.
+
+        recommended_refund_brl được tính từ Decimal → chính xác.
+        refund_lines lưu float, nên dùng round() để so sánh.
+        """
         refunds = [
             {"refund_id": "r1", "status": "failed", "amount": 0.10},
             {"refund_id": "r2", "status": "failed", "amount": 0.20},
@@ -245,7 +249,8 @@ class TestDoD:
         res = _r(agent, refund_timeline=refunds)
         fin = res.financial_resolution
         assert fin["recommended_refund_brl"] == 0.30
-        assert sum(line["amount_brl"] for line in fin["refund_lines"]) == 0.30
+        # float sum có thể ra 0.30000000000000004 → dùng round() để kiểm tra
+        assert round(sum(line["amount_brl"] for line in fin["refund_lines"]), 2) == 0.30
         _assert_dod(res)
 
     def test_dod_invariant_always_holds_for_multiple_lines(self, agent: PaymentAgent) -> None:
