@@ -33,6 +33,26 @@ class PaymentResolutionAgent:
         if not order_id:
             return result
 
+        # 0. Lấy policy trước để phục vụ phán quyết tài chính
+        policy_version = case.get("policy_version", "EC_POLICY_V1")
+        try:
+            pol_ev = await gateway.call("get_policy", case_id=case_id, policy_version=policy_version)
+            pol_ref = pol_ev.get("evidence_ref")
+            if pol_ref:
+                result.policy_ev_ref = pol_ref
+                result.evidence_refs.append(pol_ref)
+                trace.emit(
+                    case_id=case_id,
+                    event_type="tool_result_consumed",
+                    actor=self.actor_name,
+                    tool_name="get_policy",
+                    evidence_refs=[pol_ref],
+                )
+            pol_data = pol_ev.get("data", {})
+            result.policy_rules = pol_data if isinstance(pol_data, dict) else {}
+        except Exception as exc:
+            logger.info(f"[{case_id}] get_policy error: {exc}")
+
         # 1. Gọi MCP get_order_payments
         payments: list[dict[str, Any]] = []
         try:
@@ -90,7 +110,7 @@ class PaymentResolutionAgent:
                 e for e in t_data.get("events", []) if e.get("event_type") == "captured"
             ]
             t_payments = t_data.get("payments", [])
-            if len(captured_events) >= 4 or (len(t_payments) > len(payments) and len(t_payments) >= 4):
+            if len(captured_events) >= 2 or (len(t_payments) > len(payments) and len(t_payments) >= 2):
                 result.is_duplicate_charge = True
         except Exception as exc:
             logger.info(f"[{case_id}] get_payment_timeline error or not available: {exc}")
@@ -176,7 +196,7 @@ class PaymentResolutionAgent:
             )
             result.resolution_actions.append("issue_full_refund")
 
-        elif expected_total > 0 and abs(result.total_paid_brl - expected_total) >= 0.05 and not result.is_duplicate_charge:
+        elif expected_total > 0 and abs(result.total_paid_brl - expected_total) >= 0.50 and not result.is_duplicate_charge:
             result.is_payment_mismatch = True
             result.suggested_issue = "payment_mismatch"
             diff = round(abs(result.total_paid_brl - expected_total), 2)

@@ -89,6 +89,21 @@ class CoordinatorAgent:
         elif not actions:
             actions = ["investigate_further"]
 
+        # Phát hiện data_conflicts khi số tiền thanh toán lệch với tổng đơn hàng
+        data_conflicts: list[dict[str, Any]] = []
+        if (
+            order_res.order_total_brl > 0
+            and payment_res.total_paid_brl > 0
+            and abs(payment_res.total_paid_brl - order_res.order_total_brl) >= 0.50
+            and not payment_res.is_duplicate_charge
+        ):
+            data_conflicts.append({
+                "field": "order_total_brl",
+                "sources": ["get_order_items", "get_order_payments"],
+                "selected_source": "get_order_payments",
+                "resolution_code": "PREFER_PAYMENT_RECORD",
+            })
+
         raw_output: dict[str, Any] = {
             "schema_version": "day09-l3a-output-v2",
             "case_id": case_id,
@@ -101,7 +116,7 @@ class CoordinatorAgent:
             "claim_assessments": payment_res.claim_assessments,
             "root_cause_analysis": root_cause,
             "evidence_refs": all_evidence,
-            "data_conflicts": [],
+            "data_conflicts": data_conflicts,
             "financial_resolution": {
                 "currency": "BRL",
                 "recommended_refund_brl": payment_res.recommended_refund_brl if case_status != "no_action" else 0.0,
@@ -126,7 +141,12 @@ class CoordinatorAgent:
         """Quyết định primary_issue dựa trên việc xác thực Claim mà khách khiếu nại."""
         customer_req = case.get("customer_request", {})
         claims = customer_req.get("claims", [])
-        
+
+        # Confidence calibration: phản ánh chất lượng evidence thực tế
+        total_ev = len(order_res.evidence_refs) + len(pay_res.evidence_refs)
+        hi = 0.92 if total_ev >= 5 else (0.82 if total_ev >= 3 else 0.72)
+        lo = 0.82 if total_ev >= 5 else (0.72 if total_ev >= 3 else 0.62)
+
         # Lấy claimed topic cốt lõi (bỏ qua requested_full_refund vì đó là yêu cầu bồi thường)
         claimed_topic = None
         for cl in claims:
@@ -139,57 +159,57 @@ class CoordinatorAgent:
         if claimed_topic in ["late_delivery_seller", "late_delivery_logistics"]:
             if order_res.is_late:
                 target_issue = order_res.suggested_issue or claimed_topic
-                return target_issue, "action_required", 0.95
+                return target_issue, "action_required", hi
             else:
-                return "unsupported_claim", "no_action", 0.90
+                return "unsupported_claim", "no_action", hi
 
         # 2. Nếu khách khiếu nại về đơn bị hủy/không có hàng
         if claimed_topic in ["canceled_order_paid", "unavailable_order_paid"]:
             if order_res.order_status in ["canceled", "unavailable"]:
-                return claimed_topic, "action_required", 0.95
+                return claimed_topic, "action_required", hi
             else:
-                return "unsupported_claim", "no_action", 0.90
+                return "unsupported_claim", "no_action", hi
 
         # 3. Nếu khách khiếu nại về hoàn tiền (pending hoặc failed)
         if claimed_topic == "refund_pending":
             if pay_res.refund_status == "pending":
-                return "refund_pending", "needs_investigation", 0.95
-            return "unsupported_claim", "no_action", 0.90
+                return "refund_pending", "needs_investigation", hi
+            return "unsupported_claim", "no_action", hi
 
         if claimed_topic == "refund_failed":
             if pay_res.refund_status == "failed":
-                return "refund_failed", "action_required", 0.95
-            return "unsupported_claim", "no_action", 0.90
+                return "refund_failed", "action_required", hi
+            return "unsupported_claim", "no_action", hi
 
         # 4. Nếu khách khiếu nại về trừ trùng (duplicate charge)
         if claimed_topic == "duplicate_charge":
             if pay_res.is_duplicate_charge:
-                return "duplicate_charge", "action_required", 0.95
-            return "unsupported_claim", "no_action", 0.90
+                return "duplicate_charge", "action_required", hi
+            return "unsupported_claim", "no_action", hi
 
         # 5. Nếu khách khiếu nại về chia thanh toán hợp lệ (valid_split_payment)
         if claimed_topic == "valid_split_payment":
-            return "valid_split_payment", "no_action", 0.95
+            return "valid_split_payment", "no_action", hi
 
         # 6. Nếu khách khiếu nại về lệch tiền thanh toán (payment_mismatch)
         if claimed_topic == "payment_mismatch":
             if pay_res.is_payment_mismatch:
-                return "payment_mismatch", "action_required", 0.95
-            return "unsupported_claim", "no_action", 0.90
+                return "payment_mismatch", "action_required", hi
+            return "unsupported_claim", "no_action", hi
 
         # 7. Nếu khách khiếu nại vô căn cứ (unsupported_claim)
         if claimed_topic == "unsupported_claim":
-            return "unsupported_claim", "no_action", 0.95
+            return "unsupported_claim", "no_action", hi
 
         # Fallback dựa trên phát hiện của agent nếu không có claim rõ ràng
         if pay_res.suggested_issue:
             st = "needs_investigation" if pay_res.suggested_issue == "refund_pending" else "action_required"
-            return pay_res.suggested_issue, st, 0.85
+            return pay_res.suggested_issue, st, lo
 
         if order_res.suggested_issue:
-            return order_res.suggested_issue, "action_required", 0.85
+            return order_res.suggested_issue, "action_required", lo
 
-        return "unsupported_claim", "no_action", 0.80
+        return "unsupported_claim", "no_action", lo
 
     def _build_root_cause(
         self, primary_issue: str, order_res: OrderLogisticsResult, pay_res: PaymentResolutionResult

@@ -31,6 +31,8 @@ class OrderLogisticsResult:
     
     # Bằng chứng
     evidence_refs: list[str] = field(default_factory=list)
+    policy_ev_ref: str | None = None
+    policy_rules: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -54,6 +56,9 @@ class PaymentResolutionResult:
     
     # Bằng chứng
     evidence_refs: list[str] = field(default_factory=list)
+    policy_ev_ref: str | None = None
+    policy_rules: dict[str, Any] = field(default_factory=dict)
     
     # Đánh giá claims
     claim_assessments: list[dict[str, Any]] = field(default_factory=list)
+

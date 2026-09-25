@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any
 
 from ..mcp_gateway import EvidenceGateway
@@ -128,6 +129,15 @@ class OrderLogisticsAgent:
 
         return result
 
+    @staticmethod
+    def _parse_dt(s: str | None) -> datetime | None:
+        if not s:
+            return None
+        try:
+            return datetime.fromisoformat(s)
+        except (ValueError, TypeError):
+            return None
+
     def _analyze_delivery_timeline(
         self, result: OrderLogisticsResult, shipment_data: dict[str, Any]
     ) -> None:
@@ -159,18 +169,22 @@ class OrderLogisticsAgent:
 
         # Lấy hạn giao sớm nhất của các items
         shipping_limits = shipment_data.get("shipping_limits", [])
-        earliest_limit = None
+        earliest_limit: str | None = None
         for sl in shipping_limits:
             limit_at = sl.get("shipping_limit_at")
             if limit_at and (earliest_limit is None or limit_at < earliest_limit):
                 earliest_limit = limit_at
 
-        if delivered_customer and estimated_delivery:
-            if delivered_customer > estimated_delivery:
-                result.is_late = True
-                if delivered_carrier and earliest_limit and delivered_carrier > earliest_limit:
-                    result.delay_party = "seller"
-                    result.suggested_issue = "late_delivery_seller"
-                else:
-                    result.delay_party = "logistics_provider"
-                    result.suggested_issue = "late_delivery_logistics"
+        dt_delivered = self._parse_dt(delivered_customer)
+        dt_estimated = self._parse_dt(estimated_delivery)
+        dt_carrier = self._parse_dt(delivered_carrier)
+        dt_limit = self._parse_dt(earliest_limit)
+
+        if dt_delivered and dt_estimated and dt_delivered > dt_estimated:
+            result.is_late = True
+            if dt_carrier and dt_limit and dt_carrier > dt_limit:
+                result.delay_party = "seller"
+                result.suggested_issue = "late_delivery_seller"
+            else:
+                result.delay_party = "logistics_provider"
+                result.suggested_issue = "late_delivery_logistics"
