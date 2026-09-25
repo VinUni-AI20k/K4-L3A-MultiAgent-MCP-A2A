@@ -15,9 +15,12 @@ from .trace import TraceWriter
 # recomputed per case from real evidence instead of the policy template's constants.
 
 # ponytail: every case mixes the real lifecycle (captures at purchase, refunds ~est+1d,
-# shipment events on delivery day) with a decoy block shifted >=18 days away, so the
-# window is anchored to this order's own dates instead of a wide fixed range.
+# shipment events on delivery day) with a decoy block shifted by >=9 days, so windows
+# are anchored to this order's own dates: payment events must sit on the purchase day,
+# refunds/shipment events inside purchase..delivery/estimate. A decoy shifted <1 day
+# would slip through; tighten with per-block grouping if that ever shows up.
 _WINDOW_BEFORE = timedelta(days=1)
+_PAYMENT_WINDOW = timedelta(days=1)
 _WINDOW_AFTER_LIFECYCLE = timedelta(days=2)
 _LATE_EVENT_TOLERANCE = timedelta(days=2)
 
@@ -155,7 +158,7 @@ def _classify(
         {
             (e["event_at"], e["event_type"], e["amount_brl"]): e
             for e in pay_events
-            if in_lifecycle(e["event_at"])
+            if abs(_dt(e["event_at"]) - purchase_at) <= _PAYMENT_WINDOW
         }.values()
     )
     if len(good_pay_events) != len(pay_events):
@@ -189,7 +192,13 @@ def _classify(
 
     refund_events: list[dict[str, Any]] = []
     if refund_timeline is not None:
-        refund_events = [e for e in refund_timeline["events"] if in_lifecycle(e["event_at"])]
+        # A real refund returns money this lifecycle actually captured.
+        captured_amounts = {_money(e["amount_brl"]) for e in good_captured}
+        refund_events = [
+            e
+            for e in refund_timeline["events"]
+            if in_lifecycle(e["event_at"]) and _money(e["amount_brl"]) in captured_amounts
+        ]
         if len(refund_events) != len(refund_timeline["events"]):
             conflicts.append(
                 {

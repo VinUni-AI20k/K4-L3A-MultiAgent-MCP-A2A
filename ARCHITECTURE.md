@@ -52,8 +52,9 @@ possibility of a coordination loop. Handoff points are traced explicitly:
 - `verification_completed` after the verifier's checks.
 
 Timeouts are delegated to `httpx2`'s client timeout (300s) configured in
-`mcp_gateway.connect_gateway`; there is no agent-level retry loop, so no retry-induced
-cycle is possible.
+`mcp_gateway.connect_gateway`. Transient transport/gateway errors (`MCPError`,
+`httpx2.HTTPError`) are retried at most 3 times with linear backoff inside
+`EvidenceGateway.call`; tool-level errors are never retried, so no unbounded loop exists.
 
 ## 4. Evidence lifecycle
 
@@ -73,12 +74,12 @@ constructed by hand — every ref in the output was returned by a real `gateway.
 
 | Failure | Retry? | Fallback | Trace event/code |
 | --- | --- | --- | --- |
-| MCP timeout / tool error | No (single attempt) | Treated as "evidence absent"; `get_order`/`get_order_items` failing aborts the case as `insufficient_evidence`, other domains are optional and degrade the classifier's inputs | `verification_completed` with `decision_code=insufficient_evidence` |
+| MCP timeout / tool error | Transport errors: up to 3 attempts; tool errors: no | Treated as "evidence absent"; `get_order`/`get_order_items` failing aborts the case as `insufficient_evidence`, other domains are optional and degrade the classifier's inputs | `verification_completed` with `decision_code=insufficient_evidence` |
 | Not found (e.g. no refund history) | No | Treated as "lifecycle event never occurred" (`refund_timeline=None`), not as missing/invalid data | n/a (no event emitted for a domain never fetched) |
 | Source conflict (order-level facts vs. a shipment/payment event) | No | The order-level, purchase-timestamp-anchored fact wins; the disagreeing event is recorded, never silently dropped | `data_conflicts[]` entry with `resolution_code` |
 | Invalid specialist result (schema violation) | No | `Contracts.validate_evidence` raises `ContractError` before the workflow sees the data — this is a real bug, not a case outcome, so it is not caught | n/a — propagates and fails the run |
 
-No retry loop exists because every MCP call is a single, idempotent read; a second
+Tool-level errors are not retried because every MCP call is a single, idempotent read; a second
 identical call would return the same evidence (or the same "not found"), so retrying
 cannot change the outcome and is not attempted. Missing evidence always results in a lower
 `confidence` and/or `primary_issue = insufficient_evidence`, never a fabricated value.
@@ -116,12 +117,18 @@ clean). Checks:
   non-null `party_id`; `party_id` itself is set from the classifier's `seller_id` only
   when `get_policy`'s rule for this issue names `party_type == "seller"` (not from a
   per-branch heuristic), so it cannot disagree with the policy-authoritative party type.
+- **Lifecycle scoping**: every case's evidence mixes the real order lifecycle with a
+  decoy block of records shifted days/months away. `_classify()` keeps only payment
+  events on the purchase day (±1 day, byte-identical replicas collapsed), refund and
+  shipment events inside purchase..max(delivery, estimate)+2 days, and refunds whose
+  amount matches a real capture; every exclusion is recorded in `data_conflicts`.
+  Branch order: mismatch → canceled/unavailable → late → refund failed/pending →
+  duplicate capture → reconciled split/unsupported → insufficient.
 - **Confidence bounds**: every branch of `_classify()` returns a fixed confidence in
-  `[0.5, 0.95]` depending on signal strength (explicit event-driven signals like
-  `reconciliation_mismatch`/`order_status`/refund-lifecycle status/exact duplicate rows
-  score 0.95; late delivery scores 0.85 with a matching shipment event, 0.65 when
-  actor-inferred; split/unsupported score 0.8; `insufficient_evidence` is fixed at 0.5,
-  or 0.3 when `_verify` itself triggers the downgrade).
+  `[0.5, 0.95]` depending on signal strength (mismatch/order_status/refund failed/
+  duplicate capture score 0.95; late delivery 0.9 with a matching shipment event, 0.65
+  when actor-inferred; refund pending/split/unsupported 0.9; `insufficient_evidence` is
+  fixed at 0.5, or 0.3 when `_verify` itself triggers the downgrade).
 
 ## 7. Reproducibility
 
