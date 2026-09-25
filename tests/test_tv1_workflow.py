@@ -405,3 +405,77 @@ def test_transient_mcp_error_is_retried(tmp_path: Path, monkeypatch: pytest.Monk
     out = asyncio.run(solve_case(make_case("unsupported_claim"), gateway, trace))
     assert out["assessment"]["case_status"] == "no_action"
     assert out["resolution_actions"] == ["document_no_action"]
+
+
+def test_dead_transport_is_not_swallowed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mcp.shared.exceptions import MCPError
+
+    from student_agent.agents import base
+
+    monkeypatch.setattr(base, "RETRY_BACKOFF_SECONDS", 0)
+    gateway = FakeGateway()
+
+    async def dead(tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+        raise MCPError(code=-32000, message="Connection closed")
+
+    gateway.call = dead  # type: ignore[method-assign]
+    trace = TraceWriter(tmp_path / "trace.jsonl", CONTRACTS)
+    with pytest.raises(base.TransportLost):
+        asyncio.run(solve_case(make_case("unsupported_claim"), gateway, trace))
+
+
+def test_cli_reconnects_and_redoes_only_the_interrupted_case(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import contextlib
+    import shutil
+
+    from student_agent import cli
+    from student_agent.agents import base
+
+    monkeypatch.setattr(base, "RETRY_BACKOFF_SECONDS", 0)
+    monkeypatch.setattr(cli, "RECONNECT_DELAY_SECONDS", 0)
+    for name in ("contracts",):
+        shutil.copytree(ROOT / name, tmp_path / name)
+    ids = ["L3A_CASE_901", "L3A_CASE_902"]
+    (tmp_path / "inputs").mkdir()
+    for cid in ids:
+        case = make_case("unsupported_claim")
+        case["case_id"] = cid
+        (tmp_path / "inputs" / f"{cid}.json").write_text(json.dumps(case), "utf-8")
+    (tmp_path / "case-set.json").write_text(json.dumps(
+        {"case_set_version": "t", "variant_id": "l3a", "case_ids": ids}), "utf-8")
+    monkeypatch.setattr(cli, "load_case_set", lambda root: __import__(
+        "student_agent.cases", fromlist=["load_case_set"]).load_case_set(root, expected_count=2))
+    monkeypatch.setattr(cli.Settings, "load", classmethod(lambda cls, root: cls(
+        "http://x", "sk-team-" + "a" * 20, "http://x/mcp", root)))
+    sessions = {"n": 0}
+
+    @contextlib.asynccontextmanager
+    async def fake_connect(endpoint: str, key: str, contracts: Contracts):  # type: ignore[no-untyped-def]
+        sessions["n"] += 1
+        gateway = FakeGateway()
+        if sessions["n"] == 1:  # phiên đầu chết giữa case thứ 2
+            real = gateway.call
+
+            async def flaky(tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+                if case_id == "L3A_CASE_902" and tool_name == "get_payment_timeline":
+                    raise MCPError(code=-32000, message="Connection closed")
+                return await real(tool_name, case_id=case_id, **arguments)
+
+            gateway.call = flaky  # type: ignore[method-assign]
+        gateway.list_tools = lambda: asyncio.sleep(0, result=["get_order"])  # type: ignore[attr-defined]
+        yield gateway
+
+    from mcp.shared.exceptions import MCPError
+
+    monkeypatch.setattr(cli, "connect_gateway", fake_connect)
+    asyncio.run(cli._run(tmp_path))
+    assert sessions["n"] == 2
+    events = [json.loads(x) for x in (tmp_path / "traces" / "trace.jsonl").read_text("utf-8")
+              .splitlines()]
+    received = [e["case_id"] for e in events if e["event_type"] == "case_received"]
+    assert received == ids  # case 902 chỉ còn 1 lần chạy (lần dở đã bị cắt khỏi trace)
+    for cid in ids:
+        out = json.loads((tmp_path / "outputs" / f"{cid}.json").read_text("utf-8"))
+        assert out["assessment"]["primary_issue"] == "unsupported_claim"

@@ -108,15 +108,21 @@ class EvidenceLedger:
         return [ref for ref in dict.fromkeys(refs) if ref in self.records]
 
 
+class TransportLost(BaseException):  # noqa: N818
+    """Kết nối MCP chết sau khi đã retry. Kế thừa BaseException để các ``except Exception``
+    trong agent KHÔNG nuốt mất: case phải được chạy lại trên kết nối mới (cli.py), không
+    được ghi ra output thiếu evidence."""
+
+
 async def call_with_retry(
     gateway: Any, tool_name: str, case_id: str, **arguments: str
 ) -> dict[str, Any]:
     for attempt in range(1, MAX_TOOL_ATTEMPTS + 1):
         try:
             return await gateway.call(tool_name, case_id=case_id, **arguments)
-        except _RETRYABLE:
+        except _RETRYABLE as exc:
             if attempt == MAX_TOOL_ATTEMPTS:
-                raise
+                raise TransportLost(f"{tool_name}: {type(exc).__name__}") from exc
             await asyncio.sleep(RETRY_BACKOFF_SECONDS * attempt)
     raise AssertionError("unreachable")
 
