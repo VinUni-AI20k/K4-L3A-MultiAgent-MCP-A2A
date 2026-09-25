@@ -3,6 +3,7 @@
 from .policy_agent import PolicyAgent, PolicyDecision
 from .state import CaseState, EvidenceRecord
 from .verifier_agent import VerificationError, VerifierAgent
+from .order_agent import OrderAgent
 
 __all__ = [
     "CaseState",
@@ -11,4 +12,5 @@ __all__ = [
     "PolicyDecision",
     "VerificationError",
     "VerifierAgent",
+    "OrderAgent"
 ]
