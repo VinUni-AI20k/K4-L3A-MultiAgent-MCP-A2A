@@ -39,6 +39,31 @@ pytest -q
 day09 --help
 ```
 
+### Model local cho multi-agent
+
+Workflow mặc định dùng Ollama qua API tương thích OpenAI. Các specialist chạy song song:
+
+```bash
+ollama pull qwen3:1.7b
+```
+
+Năm vai trò đều dùng Qwen3 1.7B, tổng ngân sách bảo thủ 8.5B. Order/Payment và
+Policy/Resolution luôn chạy song song; Shipment/Seller chỉ gọi model cho claim giao hàng.
+Có thể đổi endpoint/model và khai báo tham số bằng các biến `LLM_*` trong
+`.env`; không đưa API key vào source, output hoặc trace.
+
+Để Ollama phục vụ ba specialist đồng thời trên Windows, đặt `OLLAMA_NUM_PARALLEL=3` rồi
+khởi động lại `ollama serve`. Client dùng context 4096 và giới hạn concurrency bằng
+`LLM_MAX_PARALLEL_SPECIALISTS=3`.
+
+Ý nghĩa các thư mục runtime:
+
+- `contracts/`: public contract chỉ đọc, luôn được ưu tiên cao nhất;
+- `inputs/`: yêu cầu/claim ban đầu, không phải ground truth;
+- `outputs/`: JSON kết luận theo từng case;
+- `tests/`: kiểm tra unit, graph, evidence và contract;
+- `traces/`: lifecycle observable của các agent, không chứa chain-of-thought.
+
 ## 2. Đăng ký team
 
 1. Mở `/register` trên Competition Workspace.
@@ -52,25 +77,33 @@ day09 --help
 COMPETITION_API_URL=http://127.0.0.1:8081
 COMPETITION_TEAM_API_KEY=sk-team-your_key
 MCP_ENDPOINT=http://127.0.0.1:8001/mcp
+OPENROUTER_API_KEY=sk-or-v1-your_key
+OPENROUTER_MODEL=qwen/qwen3-8b
 ```
+
+Workflow dùng Qwen3 8B làm verifier và từ chối model không nằm trong allowlist dưới
+10B tham số. Không commit `.env` hoặc gửi API key vào output/trace.
 
 ## 3. Tải input
 
-Tải ZIP input **L3A** từ GitHub Release và giải nén vào root repo:
+Đăng nhập workspace `/l3a` bằng Team API Key, để hệ thống tạo scoped run, rồi tải ZIP
+input **L3A của run hiện tại** và giải nén vào root repo. Bundle do workspace cấp là
+nguồn chuẩn về `case_set_version`, danh sách case và cấu hình MCP.
 
 ```bash
 unzip l3a-inputs-<version>.zip -d .
 day09 validate-inputs
 ```
 
-Cấu trúc đúng:
+Cấu trúc đúng (số file phải khớp chính xác `case-set.json`; workspace hiện tại có thể
+yêu cầu 50 output dù starter/release cũ có 100 case):
 
 ```text
 case-set.json
 inputs/
 ├── L3A_CASE_001.json
 ├── ...
-└── L3A_CASE_100.json
+└── ...
 ```
 
 ## 4. Sử dụng MCP
@@ -142,7 +175,8 @@ Gợi ý có thể tổ chức các vai trò:
 
 Competition không chấm tên framework hay số lượng class. Scorer đánh giá kết quả, evidence và sự phối hợp thể hiện trong trace.
 
-Hoàn thiện mô tả thiết kế trong `ARCHITECTURE.md`.
+Hoàn thiện mô tả thiết kế trong `ARCHITECTURE.md`, gồm DAG A2A, tool
+permissions, evidence provenance, retry và verification invariants.
 
 ## 6. Chạy và kiểm tra
 
@@ -151,6 +185,15 @@ day09 run
 day09 validate
 ```
 
+`day09 run` tạo một Competition run mới trước khi gọi MCP để evidence và submission
+cùng audit scope. Không mở lại workspace hoặc tạo run khác trong lúc lệnh đang chạy.
+`day09 run --resume` giữ nguyên run hiện tại; cần resume và nộp bài trước thời điểm run
+hết hạn được in ở đầu lệnh.
+
+Nếu run bị ngắt, dùng `day09 run --resume`. Chỉ các case có output đúng contract và có
+event `case_finalized` mới được bỏ qua; trace của case đang chạy được ghi tạm rồi mới ghép
+vào trace chung để tránh làm hỏng toàn bộ tiến độ.
+
 Kết quả được tạo tại:
 
 ```text
@@ -158,7 +201,7 @@ outputs/<case_id>.json
 traces/trace.jsonl
 ```
 
-Nếu output pass schema nhưng điểm thấp, cần kiểm tra lại semantic, evidence, consistency, confidence và workflow — schema chỉ là một phần nhỏ của điểm.
+Nếu output pass schema nhưng điểm thấp, cần kiểm tra lại semantic, evidence, consistency, confidence và workflow — schema chỉ là một phần nhỏ của điểm. Validator local chỉ xác nhận bundle đang có; trước khi upload phải đối chiếu số output với quy tắc hiển thị trên workspace của scoped run.
 
 ## 7. Đóng gói và nộp bài
 

@@ -14,6 +14,15 @@ from .contracts import Contracts
 SECRET_PATTERN = re.compile(r"sk-team-[A-Za-z0-9_-]{8,}")
 MAX_FILE_BYTES = 1024 * 1024
 MAX_SUBMISSION_BYTES = 12 * 1024 * 1024
+REQUIRED_LIFECYCLE = (
+    "case_received",
+    "task_assigned",
+    "tool_result_consumed",
+    "handoff",
+    "policy_decided",
+    "verification_completed",
+    "case_finalized",
+)
 
 
 def _json_object(path: Path) -> dict[str, Any]:
@@ -56,6 +65,17 @@ def validate_artifacts(
         contracts.validate_output(output, f"outputs/{case_id}.json")
         if output.get("case_id") != case_id:
             raise ValueError(f"outputs/{case_id}.json has a mismatched case_id")
+        if not output.get("evidence_refs"):
+            raise ValueError(f"outputs/{case_id}.json has no auditable evidence_refs")
+        empty_claims = [
+            item.get("claim_id", "<unknown>")
+            for item in output.get("claim_assessments", [])
+            if not item.get("evidence_refs")
+        ]
+        if empty_claims:
+            raise ValueError(
+                f"outputs/{case_id}.json has claims without evidence_refs: {empty_claims}"
+            )
         outputs[case_id] = output
 
     trace_path = root / "traces" / "trace.jsonl"
@@ -64,6 +84,9 @@ def validate_artifacts(
     except (OSError, UnicodeDecodeError) as exc:
         raise ValueError("traces/trace.jsonl is missing or not UTF-8") from exc
     normalized_lines: list[str] = []
+    events_by_case: dict[str, list[dict[str, Any]]] = {
+        case_id: [] for case_id in case_set.case_ids
+    }
     seen_events: set[str] = set()
     for number, line in enumerate(trace_lines, 1):
         if not line.strip():
@@ -78,7 +101,39 @@ def validate_artifacts(
         if event["event_id"] in seen_events:
             raise ValueError(f"traces/trace.jsonl:{number}: duplicate event_id")
         seen_events.add(event["event_id"])
+        events_by_case[event["case_id"]].append(event)
         normalized_lines.append(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+
+    for case_id in case_set.case_ids:
+        case_events = events_by_case[case_id]
+        event_types = [event["event_type"] for event in case_events]
+        missing = [event_type for event_type in REQUIRED_LIFECYCLE if event_type not in event_types]
+        if missing:
+            raise ValueError(f"traces/trace.jsonl:{case_id}: missing lifecycle events {missing}")
+        if event_types[0] != "case_received" or event_types[-1] != "case_finalized":
+            raise ValueError(f"traces/trace.jsonl:{case_id}: invalid lifecycle boundaries")
+        positions = [event_types.index(event_type) for event_type in REQUIRED_LIFECYCLE]
+        if positions != sorted(positions) or len(set(positions)) != len(positions):
+            raise ValueError(f"traces/trace.jsonl:{case_id}: lifecycle events are out of order")
+        if event_types.count("case_received") != 1 or event_types.count("case_finalized") != 1:
+            raise ValueError(f"traces/trace.jsonl:{case_id}: duplicate lifecycle boundary")
+
+        output_refs = set(outputs[case_id]["evidence_refs"])
+        consumed_refs = {
+            evidence_ref
+            for event in case_events
+            if event["event_type"] == "tool_result_consumed"
+            for evidence_ref in event.get("evidence_refs", [])
+        }
+        if not output_refs.issubset(consumed_refs):
+            raise ValueError(
+                f"traces/trace.jsonl:{case_id}: output evidence lacks tool consumption"
+            )
+        for claim in outputs[case_id].get("claim_assessments", []):
+            if not set(claim["evidence_refs"]).issubset(output_refs):
+                raise ValueError(
+                    f"traces/trace.jsonl:{case_id}: claim evidence is outside output evidence"
+                )
 
     serialized = [json.dumps(value, ensure_ascii=False) for value in outputs.values()]
     if SECRET_PATTERN.search("\n".join([*serialized, *normalized_lines])):
