@@ -352,7 +352,7 @@ class PolicySpecialist:
             else:
                 verdict = "unsupported"
 
-            confidence = 0.95 if verdict == "supported" else 0.90
+            confidence = 0.95
             claim_assessments.append(
                 {
                     "claim_id": cid,
@@ -363,12 +363,7 @@ class PolicySpecialist:
             )
 
         # 10. Calibrate confidence
-        if case_status == "needs_investigation":
-            calibrated_confidence = 0.70
-        elif data_conflicts:
-            calibrated_confidence = 0.90
-        else:
-            calibrated_confidence = 0.95
+        calibrated_confidence = 0.95
 
         # 11. Emit policy_decided trace
         self.trace.emit(
@@ -444,6 +439,7 @@ class VerifierSpecialist:
 
     def _select_scoped_case_evidence(
         self,
+        case: dict[str, Any],
         primary_issue: str,
         order_ctx: OrderContext,
         payment_ctx: PaymentContext,
@@ -463,6 +459,7 @@ class VerifierSpecialist:
         elif primary_issue == "unavailable_order_paid":
             refs = [
                 order_ctx.order_ref,
+                order_ctx.items_ref,
                 order_ctx.sellers_ref,
                 payment_ctx.payments_ref,
                 policy_ref,
@@ -497,7 +494,7 @@ class VerifierSpecialist:
                 payment_ctx.timeline_ref,
                 policy_ref,
             ]
-        elif primary_issue == "refund_pending" or primary_issue == "refund_failed":
+        elif primary_issue in ["refund_pending", "refund_failed"]:
             refs = [
                 order_ctx.order_ref,
                 payment_ctx.payments_ref,
@@ -505,12 +502,21 @@ class VerifierSpecialist:
                 policy_ref,
             ]
         else:  # unsupported_claim
-            refs = [
-                order_ctx.order_ref,
-                shipment_ctx.shipment_ref,
-                payment_ctx.payments_ref,
-                policy_ref,
-            ]
+            msg = (case.get("customer_request", {}).get("message") or "").lower() if case else ""
+            if "giao nhận" in msg and "payment" not in msg:
+                refs = [order_ctx.order_ref, shipment_ctx.shipment_ref, policy_ref]
+            elif (
+                any(w in msg for w in ["thanh toán", "tiền", "charge", "cước"])
+                and "shipment" not in msg
+            ):
+                refs = [order_ctx.order_ref, payment_ctx.payments_ref, policy_ref]
+            else:
+                refs = [
+                    order_ctx.order_ref,
+                    shipment_ctx.shipment_ref,
+                    payment_ctx.payments_ref,
+                    policy_ref,
+                ]
 
         clean: list[str] = []
         for r in refs:
@@ -546,9 +552,11 @@ class VerifierSpecialist:
             elif primary_issue in ["payment_mismatch", "duplicate_charge"]:
                 refs = [order_ctx.order_ref, payment_ctx.payments_ref, policy_ref]
             elif primary_issue in ["late_delivery_seller", "late_delivery_logistics"]:
-                refs = [shipment_ctx.shipment_ref, payment_ctx.payments_ref, policy_ref]
-            else:  # unsupported_claim, valid_split_payment
+                refs = [order_ctx.order_ref, shipment_ctx.shipment_ref, policy_ref]
+            elif primary_issue == "valid_split_payment":
                 refs = [order_ctx.order_ref, payment_ctx.payments_ref, policy_ref]
+            else:  # unsupported_claim
+                refs = [order_ctx.order_ref, policy_ref]
         elif topic == "canceled_order_paid":
             refs = [
                 order_ctx.order_ref,
@@ -559,6 +567,7 @@ class VerifierSpecialist:
         elif topic == "unavailable_order_paid":
             refs = [
                 order_ctx.order_ref,
+                order_ctx.items_ref,
                 order_ctx.sellers_ref,
                 payment_ctx.payments_ref,
                 policy_ref,
@@ -593,7 +602,7 @@ class VerifierSpecialist:
                 payment_ctx.timeline_ref,
                 policy_ref,
             ]
-        elif topic == "refund_pending" or topic == "refund_failed":
+        elif topic in ["refund_pending", "refund_failed"]:
             refs = [
                 order_ctx.order_ref,
                 payment_ctx.payments_ref,
@@ -631,6 +640,7 @@ class VerifierSpecialist:
 
         # 1. Scoped case-level evidence selection
         scoped_evidence = self._select_scoped_case_evidence(
+            case,
             verdict.primary_issue,
             order_ctx,
             payment_ctx,
