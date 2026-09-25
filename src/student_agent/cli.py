@@ -6,7 +6,7 @@ import json
 import sys
 from pathlib import Path
 
-from .cases import load_case_set
+from .cases import CaseSet, load_case_set
 from .config import Settings
 from .contracts import Contracts
 from .mcp_gateway import connect_gateway
@@ -27,10 +27,22 @@ async def _show_tools(root: Path) -> None:
             print(tool)
 
 
-async def _run(root: Path) -> None:
-    settings = Settings.load(root)
-    case_set = load_case_set(root)
-    contracts = Contracts(root / "contracts" / "schemas")
+MAX_CONCURRENT_CASES = 10
+MAX_RUN_ATTEMPTS = 4
+RETRY_DELAY_SECONDS = 30
+# Tools that legitimately error for some orders (no refund events exist).
+EXPECTED_TOOL_ERRORS = frozenset({"get_refund_timeline"})
+
+
+async def _run_once(
+    root: Path, settings: Settings, case_set: CaseSet, contracts: Contracts
+) -> str | None:
+    """Solve every case inside ONE MCP session. Returns why the run is not clean, or None.
+
+    Evidence refs are audited per team, run and case, so a run must never mix evidence
+    from two MCP sessions. On a broken session or unexpected tool errors the caller
+    discards everything and retries the whole run.
+    """
     output_root = root / "outputs"
     trace_path = root / "traces" / "trace.jsonl"
     output_root.mkdir(parents=True, exist_ok=True)
@@ -39,25 +51,61 @@ async def _run(root: Path) -> None:
         stale.unlink()
     trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
+    limit = asyncio.Semaphore(MAX_CONCURRENT_CASES)
 
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
         discovered_tools = await gateway.list_tools()
         if not discovered_tools:
             raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+
+        async def run_case(case_id: str) -> None:
+            async with limit:
+                if gateway.session_lost:
+                    return
+                case = case_set.cases[case_id]
+                trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+                output = await solve_case(case, gateway, trace)
+                if gateway.session_lost:
+                    return
+                contracts.validate_output(output, f"outputs/{case_id}.json")
+                if output.get("case_id") != case_id:
+                    raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+                target = output_root / f"{case_id}.json"
+                temporary = target.with_suffix(".json.tmp")
+                temporary.write_text(
+                    json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                )
+                temporary.replace(target)
+                trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+                print(f"{case_id}: {output['assessment']['primary_issue']}", flush=True)
+
+        await asyncio.gather(*(run_case(case_id) for case_id in case_set.case_ids))
+        unexpected = {
+            tool: count for tool, count in gateway.tool_errors.items()
+            if tool not in EXPECTED_TOOL_ERRORS
+        }
+        if gateway.session_error is None and unexpected:
+            # A healthy run only sees expected errors (orders without refund events).
+            return f"MCP tools failing server-side: {unexpected}"
+        return gateway.session_error
+
+
+async def _run(root: Path) -> None:
+    settings = Settings.load(root)
+    case_set = load_case_set(root)
+    contracts = Contracts(root / "contracts" / "schemas")
+    for attempt in range(1, MAX_RUN_ATTEMPTS + 1):
+        try:
+            error = await _run_once(root, settings, case_set, contracts)
+        except Exception as exc:  # a dying session can also surface while closing it
+            error = f"{type(exc).__name__}: {exc}"[:200]
+        if error is None:
+            return
+        print(f"attempt {attempt}: run not clean ({error}); restarting the whole run",
+              file=sys.stderr, flush=True)
+        if attempt < MAX_RUN_ATTEMPTS:
+            await asyncio.sleep(RETRY_DELAY_SECONDS * attempt)
+    raise RuntimeError(f"no clean run after {MAX_RUN_ATTEMPTS} attempts; last: {error}")
 
 
 def parser() -> argparse.ArgumentParser:

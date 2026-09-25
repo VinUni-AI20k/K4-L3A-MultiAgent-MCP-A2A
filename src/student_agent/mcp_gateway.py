@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections import Counter
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -12,19 +13,51 @@ from mcp.client.streamable_http import streamable_http_client
 from .contracts import Contracts
 
 
+class SessionLostError(RuntimeError):
+    """The MCP session broke; evidence from a new session would belong to another run."""
+
+
 class EvidenceGateway:
     def __init__(self, session: ClientSession, contracts: Contracts) -> None:
         self._session = session
         self._contracts = contracts
+        self.session_error: str | None = None
+        self.tool_successes = 0
+        self.tool_errors: Counter[str] = Counter()
+
+    @property
+    def session_lost(self) -> bool:
+        return self.session_error is not None
+
+    async def _request(self, operation: Callable[[ClientSession], Awaitable[Any]]) -> Any:
+        """Run one MCP request. Protocol/session failures mark the whole session as lost.
+
+        Tool-level errors are not exceptions here (they come back as is_error results).
+        After a session failure every call fails fast, so the caller can restart the run
+        in a fresh session instead of mixing evidence from two sessions.
+        """
+        if self.session_error is not None:
+            raise SessionLostError(f"MCP session lost: {self.session_error}")
+        try:
+            return await operation(self._session)
+        except Exception as exc:
+            self.session_error = f"{type(exc).__name__}: {exc}"[:200]
+            raise SessionLostError(f"MCP session lost: {self.session_error}") from exc
 
     async def list_tools(self) -> list[str]:
-        response = await self._session.list_tools()
+        response = await self._request(lambda session: session.list_tools())
         return sorted(tool.name for tool in response.tools)
 
     async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
-        result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        result = await self._request(
+            lambda session: session.call_tool(tool_name, arguments=payload)
+        )
+        is_error = getattr(result, "is_error", None)
+        if is_error is None:
+            is_error = getattr(result, "isError", False)
+        if is_error:
+            self.tool_errors[tool_name] += 1
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
@@ -38,6 +71,7 @@ class EvidenceGateway:
                 raise ValueError(f"MCP tool {tool_name} did not return one evidence object")
             evidence = json.loads(text_blocks[0])
         self._contracts.validate_evidence(evidence, f"MCP tool {tool_name}")
+        self.tool_successes += 1
         return evidence
 
 
