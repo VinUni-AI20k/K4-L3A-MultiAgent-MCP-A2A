@@ -10,6 +10,8 @@ requires-python = ">=3.11"
 dependencies = [
     "httpx2>=2,<3",
     "jsonschema[format]>=4.25,<5",
+    "langchain>=1,<2",
+    "langgraph>=1,<2",
     "mcp>=2,<3",
     "python-dotenv>=1.1,<2",
 ]
