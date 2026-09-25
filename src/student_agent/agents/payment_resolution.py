@@ -142,6 +142,8 @@ class PaymentResolutionAgent:
         order_status = order_ctx.order_status
         expected_total = order_ctx.order_total_brl or float(order_ctx.order_data.get("order_total_value", 0.0))
 
+        # Priority: order-state signals (canceled/unavailable) trump payment-signal (duplicate_charge),
+        # because a canceled order naturally generates multi-capture events that look like duplicates.
         if result.refund_status == "pending":
             result.suggested_issue = "refund_pending"
             result.recommended_refund_brl = 0.0
@@ -158,19 +160,6 @@ class PaymentResolutionAgent:
                 }
             )
             result.resolution_actions.append("retry_refund_payment")
-
-        elif result.is_duplicate_charge:
-            result.suggested_issue = "duplicate_charge"
-            dup_amount = round(result.total_paid_brl / 2.0, 2) if result.total_paid_brl > 0 else 0.0
-            result.recommended_refund_brl = dup_amount
-            result.refund_lines.append(
-                {
-                    "reason_code": "REFUND_DUPLICATE_CHARGE",
-                    "amount_brl": dup_amount,
-                    "entity_id": order_id,
-                }
-            )
-            result.resolution_actions.append("refund_duplicate_charge")
 
         elif order_status == "canceled" and result.total_paid_brl > 0:
             result.suggested_issue = "canceled_order_paid"
@@ -196,7 +185,20 @@ class PaymentResolutionAgent:
             )
             result.resolution_actions.append("issue_full_refund")
 
-        elif expected_total > 0 and abs(result.total_paid_brl - expected_total) >= 0.50 and not result.is_duplicate_charge:
+        elif result.is_duplicate_charge:
+            result.suggested_issue = "duplicate_charge"
+            dup_amount = round(result.total_paid_brl / 2.0, 2) if result.total_paid_brl > 0 else 0.0
+            result.recommended_refund_brl = dup_amount
+            result.refund_lines.append(
+                {
+                    "reason_code": "REFUND_DUPLICATE_CHARGE",
+                    "amount_brl": dup_amount,
+                    "entity_id": order_id,
+                }
+            )
+            result.resolution_actions.append("refund_duplicate_charge")
+
+        elif expected_total > 0 and abs(result.total_paid_brl - expected_total) >= 0.50:
             result.is_payment_mismatch = True
             result.suggested_issue = "payment_mismatch"
             diff = round(abs(result.total_paid_brl - expected_total), 2)
@@ -219,39 +221,63 @@ class PaymentResolutionAgent:
             claim_id = cl.get("claim_id", "")
             topic = cl.get("topic", "")
 
-            # Chọn evidence gắn chặt với domain của claim
             if topic in ["late_delivery_seller", "late_delivery_logistics"]:
                 claim_ev_refs = list(order_ctx.evidence_refs)
-                verdict = "supported" if order_ctx.suggested_issue == topic else "unsupported"
-                conf = 0.95
+                if not claim_ev_refs:
+                    verdict, conf = "insufficient_evidence", 0.60
+                elif order_ctx.suggested_issue == topic:
+                    verdict, conf = "supported", 0.95
+                elif order_ctx.is_late:
+                    # Delivery confirmed late but responsible party differs
+                    verdict, conf = "partially_supported", 0.75
+                else:
+                    verdict, conf = "unsupported", 0.90
+
             elif topic in ["refund_pending", "refund_failed"]:
                 claim_ev_refs = [refund_ev_ref] if refund_ev_ref else list(result.evidence_refs)
-                verdict = "supported" if result.suggested_issue == topic else "unsupported"
-                conf = 0.95
+                if not refund_ev_ref:
+                    verdict, conf = "insufficient_evidence", 0.60
+                elif result.suggested_issue == topic:
+                    verdict, conf = "supported", 0.95
+                else:
+                    verdict, conf = "unsupported", 0.90
+
             elif topic == "duplicate_charge":
                 claim_ev_refs = [timeline_ev_ref] if timeline_ev_ref else list(result.evidence_refs)
-                verdict = "supported" if result.is_duplicate_charge else "unsupported"
-                conf = 0.95
+                if not timeline_ev_ref:
+                    verdict, conf = "insufficient_evidence", 0.60
+                elif result.is_duplicate_charge:
+                    verdict, conf = "supported", 0.95
+                else:
+                    verdict, conf = "unsupported", 0.90
+
             elif topic in ["canceled_order_paid", "unavailable_order_paid"]:
                 claim_ev_refs = list(order_ctx.evidence_refs) + list(result.evidence_refs)
-                verdict = "supported" if order_status in ["canceled", "unavailable"] else "unsupported"
-                conf = 0.95
+                expected_status = "canceled" if topic == "canceled_order_paid" else "unavailable"
+                if not order_ctx.evidence_refs:
+                    verdict, conf = "insufficient_evidence", 0.60
+                elif order_status == expected_status:
+                    verdict, conf = "supported", 0.95
+                else:
+                    verdict, conf = "unsupported", 0.90
+
             elif topic == "requested_full_refund":
+                # Coordinator will override this verdict based on final_refund_brl
                 claim_ev_refs = list(result.evidence_refs)
                 verdict = "supported" if result.recommended_refund_brl > 0 else "unsupported"
                 conf = 0.90
+
             elif topic == "valid_split_payment":
                 claim_ev_refs = list(result.evidence_refs)
-                verdict = "supported" if result.is_split_payment else "unsupported"
-                conf = 0.95
+                verdict, conf = ("supported", 0.95) if result.is_split_payment else ("unsupported", 0.90)
+
             elif topic == "payment_mismatch":
                 claim_ev_refs = list(result.evidence_refs)
-                verdict = "supported" if result.is_payment_mismatch else "unsupported"
-                conf = 0.95
+                verdict, conf = ("supported", 0.95) if result.is_payment_mismatch else ("unsupported", 0.90)
+
             else:
                 claim_ev_refs = list(result.evidence_refs)
-                verdict = "unsupported"
-                conf = 0.90
+                verdict, conf = "unsupported", 0.90
 
             result.claim_assessments.append(
                 {
