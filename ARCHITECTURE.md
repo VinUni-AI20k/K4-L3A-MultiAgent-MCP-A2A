@@ -16,12 +16,12 @@ Input → Coordinator → Specialists → Verifier → Output
 
 | Actor | Input | Trách nhiệm | Output/handoff |
 | --- | --- | --- | --- |
-| Coordinator | TODO | TODO | TODO |
-| Order/item | TODO | TODO | TODO |
-| Payment | TODO | TODO | TODO |
-| Shipment | TODO | TODO | TODO |
-| Policy | TODO | TODO | TODO |
-| Verifier | TODO | TODO | TODO |
+| Coordinator | Local case request | Assign scoped specialists and merge only their evidence | Case-scoped output and lifecycle trace |
+| Order/item | Claimed order ID | Read authoritative order and item rows | Order status, item IDs and seller IDs |
+| Payment | Claimed order ID | Read payment lifecycle and determine captured payment state | Payment references and payment issue signals |
+| Shipment | Claimed order ID | Read delivery events and identify the delivery actor | Late-delivery signal and shipment entities |
+| Policy | Policy version | Read machine-readable policy and map a verified issue to action | Status, refund and responsible party |
+| Verifier | Specialist handoffs | Check same-case evidence linkage, schema-safe fields and action consistency | `verification_completed` event |
 
 Nêu rõ actor nào được quyền gọi tool nào. Tránh cho mọi agent quyền truy vấn tất cả tool nếu không cần thiết.
 
