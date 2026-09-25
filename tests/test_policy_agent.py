@@ -1,0 +1,120 @@
+from __future__ import annotations
+
+import asyncio
+from decimal import Decimal
+
+import pytest
+
+from conftest import FakeGateway, make_state, read_trace
+from student_agent.agents import PolicyAgent
+from student_agent.agents.policy_agent import to_money
+from student_agent.trace import TraceWriter
+
+
+def test_load_fetches_policy_scoped_to_case_and_links_trace(
+    gateway: FakeGateway, trace: TraceWriter
+) -> None:
+    state = make_state("L3A_CASE_007")
+    agent = PolicyAgent()
+
+    data = asyncio.run(agent.load(state, gateway, trace))
+    asyncio.run(agent.load(state, gateway, trace))  # cached: no second audited call
+
+    assert data["rules"]["canceled_order_paid"]["recommended_action"] == "issue_refund"
+    assert gateway.calls == [
+        ("get_policy", "L3A_CASE_007", {"policy_version": "EC_POLICY_V1"})
+    ]
+    [event] = read_trace(trace)
+    assert event["event_type"] == "tool_result_consumed"
+    assert event["actor"] == "policy-agent"
+    assert event["evidence_refs"] == state.refs_for_domain("policy")
+
+
+def test_decide_applies_policy_rule_and_emits_policy_decided(
+    gateway: FakeGateway, trace: TraceWriter
+) -> None:
+    state = make_state()
+    agent = PolicyAgent()
+    asyncio.run(agent.load(state, gateway, trace))
+
+    decision = agent.decide(state, "canceled_order_paid", trace)
+
+    assert decision.rule_found
+    assert decision.case_status == "action_required"
+    assert decision.recommended_action == "issue_refund"
+    assert decision.refund_brl == Decimal("79.00")
+    assert decision.responsible_parties == ({"party_type": "platform", "party_id": None},)
+    assert state.policy_decision is decision
+    event = read_trace(trace)[-1]
+    assert event["event_type"] == "policy_decided"
+    assert event["decision_code"] == "issue_refund"
+    assert event["evidence_refs"] == [decision.evidence_ref]
+
+
+def test_issue_without_rule_falls_back_to_investigation(
+    gateway: FakeGateway, trace: TraceWriter
+) -> None:
+    state = make_state()
+    agent = PolicyAgent()
+    asyncio.run(agent.load(state, gateway, trace))
+
+    decision = agent.decide(state, "insufficient_evidence", trace)
+
+    assert not decision.rule_found
+    assert decision.case_status == "needs_investigation"
+    assert decision.recommended_action == "request_additional_evidence"
+    assert decision.refund_brl == 0
+    assert decision.evidence_ref is None
+    assert "evidence_refs" not in read_trace(trace)[-1]
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        {"case_status": "maybe", "recommended_action": "issue_refund", "refund_brl": 1},
+        {"case_status": "action_required", "recommended_action": "", "refund_brl": 1},
+        {"case_status": "action_required", "recommended_action": "x", "refund_brl": -5},
+        "not-a-rule",
+    ],
+)
+def test_malformed_rule_is_not_trusted(rule: object) -> None:
+    state = make_state()
+    state.policy_data = {"rules": {"payment_mismatch": rule}}
+
+    decision = PolicyAgent().lookup(state, "payment_mismatch")
+
+    assert not decision.rule_found
+    assert decision.recommended_action == "escalate_manual_review"
+    assert decision.refund_brl == 0
+
+
+def test_no_action_rule_never_refunds() -> None:
+    state = make_state()
+    state.policy_data = {
+        "rules": {
+            "valid_split_payment": {
+                "case_status": "no_action",
+                "recommended_action": "document_no_action",
+                "refund_brl": 12.5,
+                "responsible_parties": [{"party_type": "customer", "party_id": None}],
+            }
+        }
+    }
+
+    assert PolicyAgent().lookup(state, "valid_split_payment").refund_brl == 0
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (79, Decimal("79.00")),
+        ("12.345", Decimal("12.35")),
+        (0.1 + 0.2, Decimal("0.30")),
+        (-1, None),
+        (True, None),
+        ("abc", None),
+        (float("nan"), None),
+    ],
+)
+def test_to_money_rounds_to_cents(raw: object, expected: Decimal | None) -> None:
+    assert to_money(raw) == expected

@@ -1,99 +1,132 @@
-"""Policy specialist agent.
-
-Owner: Thành viên 5 (feat/tv5-verifier-policy)
-
-Responsibilities:
-- Fetch platform policy via MCP
-- Determine primary_issue from the 11 possible values
-- Determine case_status: action_required / no_action / needs_investigation
-- Build root_cause_analysis (ranked_causes + responsible_parties)
-- Propose resolution_actions
-- Emit policy_decided trace event
-"""
-
 from __future__ import annotations
 
+from dataclasses import dataclass
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
 from ..mcp_gateway import EvidenceGateway
 from ..trace import TraceWriter
-from .base import BaseAgent
+from .state import CaseState
+
+POLICY_TOOL = "get_policy"
+CASE_STATUSES = ("action_required", "no_action", "needs_investigation")
+PARTY_TYPES = (
+    "seller", "platform", "logistics_provider", "payment_provider", "customer", "unknown"
+)
+CENT = Decimal("0.01")
 
 
-class PolicyAgent(BaseAgent):
-    """Specialist agent for policy evaluation and decision making."""
+def to_money(value: Any) -> Decimal | None:
+    """Parse a BRL amount into a non-negative Decimal rounded to cents, or None if invalid."""
+    if isinstance(value, bool):
+        return None
+    try:
+        amount = Decimal(str(value)).quantize(CENT, rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError):
+        return None
+    return amount if amount.is_finite() and amount >= 0 else None
 
-    def __init__(self, gateway: EvidenceGateway, trace: TraceWriter) -> None:
-        super().__init__(name="policy-agent", gateway=gateway, trace=trace)
 
-    async def run(self, case_id: str, context: dict[str, Any]) -> dict[str, Any]:
-        """Evaluate gathered evidence against platform policies.
+def clean_parties(raw: Any) -> tuple[dict[str, str | None], ...]:
+    """Keep schema-valid responsible parties, deduplicated, in order, at most 5."""
+    parties: list[dict[str, str | None]] = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict) or item.get("party_type") not in PARTY_TYPES:
+            continue
+        raw_id = item.get("party_id")
+        party_id = (raw_id.strip()[:128] or None) if isinstance(raw_id, str) else None
+        party = {"party_type": item["party_type"], "party_id": party_id}
+        if party not in parties:
+            parties.append(party)
+    return tuple(parties[:5])
 
-        Args:
-            case_id: The case identifier.
-            context: Must contain order_result, payment_result, shipment_result.
 
-        Returns:
-            Dict with keys: assessment, root_cause_analysis, resolution_actions,
-            evidence_refs.
-        """
-        evidence_refs: list[str] = []
-        policy_version = context.get("policy_version", "")  # noqa: F841 — dùng khi gọi MCP
+@dataclass(frozen=True)
+class PolicyDecision:
+    primary_issue: str
+    rule_found: bool
+    case_status: str
+    recommended_action: str
+    refund_brl: Decimal
+    responsible_parties: tuple[dict[str, str | None], ...]
+    evidence_ref: str | None
 
-        # ── Step 1: Fetch policy ─────────────────────────────────────
-        # TODO (TV5): Gọi MCP tool để lấy chính sách
-        # Ví dụ:
-        #   policy_evidence = await self.call_tool(
-        #       "get_policy", case_id, policy_version=policy_version
-        #   )
-        #   evidence_refs.append(policy_evidence["evidence_ref"])
-        #   policy_data = policy_evidence["data"]
 
-        # ── Step 2: Determine primary_issue ──────────────────────────
-        # TODO (TV5): Dựa vào order/payment/shipment results, xác định issue
-        # Các giá trị hợp lệ:
-        #   canceled_order_paid, unavailable_order_paid,
-        #   late_delivery_seller, late_delivery_logistics,
-        #   valid_split_payment, payment_mismatch,
-        #   duplicate_charge, refund_pending, refund_failed,
-        #   unsupported_claim, insufficient_evidence
-        primary_issue = "insufficient_evidence"  # TODO: determine
+class PolicyAgent:
+    """Fetches the case's platform policy and maps a primary issue to the policy rule."""
 
-        # ── Step 3: Determine case_status ────────────────────────────
-        # TODO (TV5): action_required / no_action / needs_investigation
-        case_status = "needs_investigation"  # TODO: determine
+    actor = "policy-agent"
 
-        # ── Step 4: Build root_cause_analysis ────────────────────────
-        # TODO (TV5): Xác định nguyên nhân gốc rễ
-        # ranked_causes: list of {"cause_code": "LATE_SHIPPING", "rank": 1}
-        # responsible_parties: lấy từ shipment_result hoặc tự xác định
-        root_cause_analysis = {
-            "ranked_causes": [],       # TODO: populate
-            "responsible_parties": [],  # TODO: populate
-        }
+    async def load(
+        self, state: CaseState, gateway: EvidenceGateway, trace: TraceWriter
+    ) -> dict[str, Any]:
+        if state.policy_data is not None:
+            return state.policy_data
+        evidence = await state.fetch(
+            gateway,
+            trace,
+            tool_name=POLICY_TOOL,
+            actor=self.actor,
+            policy_version=state.policy_version,
+        )
+        data = evidence.get("data")
+        state.policy_data = data if isinstance(data, dict) else {}
+        return state.policy_data
 
-        # ── Step 5: Propose resolution_actions ───────────────────────
-        # TODO (TV5): Đề xuất hành động (max 8, mỗi action max 80 chars)
-        resolution_actions: list[str] = []  # TODO: populate
-
-        # ── Emit policy_decided ──────────────────────────────────────
-        self.trace.emit(
-            case_id=case_id,
-            event_type="policy_decided",
-            actor=self.name,
-            decision_code=primary_issue,
+    def lookup(self, state: CaseState, primary_issue: str) -> PolicyDecision:
+        """Pure rule lookup; falls back to a no-refund investigation when no valid rule exists."""
+        rules = (state.policy_data or {}).get("rules")
+        rule = rules.get(primary_issue) if isinstance(rules, dict) else None
+        policy_refs = state.refs_for_domain("policy")
+        if isinstance(rule, dict):
+            status = rule.get("case_status")
+            action = rule.get("recommended_action")
+            refund = to_money(rule.get("refund_brl", 0))
+            if (
+                status in CASE_STATUSES
+                and isinstance(action, str)
+                and 0 < len(action.strip()) <= 80
+                and refund is not None
+            ):
+                return PolicyDecision(
+                    primary_issue=primary_issue,
+                    rule_found=True,
+                    case_status=status,
+                    recommended_action=action.strip(),
+                    refund_brl=Decimal(0) if status == "no_action" else refund,
+                    responsible_parties=clean_parties(rule.get("responsible_parties")),
+                    evidence_ref=policy_refs[0] if policy_refs else None,
+                )
+        action = (
+            "request_additional_evidence"
+            if primary_issue == "insufficient_evidence"
+            else "escalate_manual_review"
+        )
+        return PolicyDecision(
+            primary_issue=primary_issue,
+            rule_found=False,
+            case_status="needs_investigation",
+            recommended_action=action,
+            refund_brl=Decimal(0),
+            responsible_parties=({"party_type": "unknown", "party_id": None},),
+            evidence_ref=None,
         )
 
-        # ── Handoff ──────────────────────────────────────────────────
-        self.emit_handoff(case_id, target="coordinator")
-
-        return {
-            "assessment": {
+    def decide(self, state: CaseState, primary_issue: str, trace: TraceWriter) -> PolicyDecision:
+        decision = self.lookup(state, primary_issue)
+        state.policy_decision = decision
+        trace.emit(
+            case_id=state.case_id,
+            event_type="policy_decided",
+            actor=self.actor,
+            decision_code=decision.recommended_action,
+            evidence_refs=[decision.evidence_ref] if decision.evidence_ref else None,
+            attributes={
                 "primary_issue": primary_issue,
-                "case_status": case_status,
-                "confidence": 0.5,  # TODO: calibrate
+                "case_status": decision.case_status,
+                "refund_brl": float(decision.refund_brl),
+                "rule_found": decision.rule_found,
+                "policy_version": state.policy_version,
             },
-            "root_cause_analysis": root_cause_analysis,
-            "resolution_actions": resolution_actions,
-            "evidence_refs": evidence_refs,
-        }
+        )
+        return decision
