@@ -39,6 +39,31 @@ pytest -q
 day09 --help
 ```
 
+### Model local cho multi-agent
+
+Workflow mặc định dùng Ollama qua API tương thích OpenAI. Các specialist chạy song song:
+
+```bash
+ollama pull qwen3:1.7b
+```
+
+Năm vai trò đều dùng Qwen3 1.7B, tổng ngân sách bảo thủ 8.5B. Order/Payment và
+Policy/Resolution luôn chạy song song; Shipment/Seller chỉ gọi model cho claim giao hàng.
+Có thể đổi endpoint/model và khai báo tham số bằng các biến `LLM_*` trong
+`.env`; không đưa API key vào source, output hoặc trace.
+
+Để Ollama phục vụ ba specialist đồng thời trên Windows, đặt `OLLAMA_NUM_PARALLEL=3` rồi
+khởi động lại `ollama serve`. Client dùng context 4096 và giới hạn concurrency bằng
+`LLM_MAX_PARALLEL_SPECIALISTS=3`.
+
+Ý nghĩa các thư mục runtime:
+
+- `contracts/`: public contract chỉ đọc, luôn được ưu tiên cao nhất;
+- `inputs/`: yêu cầu/claim ban đầu, không phải ground truth;
+- `outputs/`: JSON kết luận theo từng case;
+- `tests/`: kiểm tra unit, graph, evidence và contract;
+- `traces/`: lifecycle observable của các agent, không chứa chain-of-thought.
+
 ## 2. Đăng ký team
 
 1. Mở `/register` trên Competition Workspace.
@@ -150,6 +175,15 @@ Hoàn thiện mô tả thiết kế trong `ARCHITECTURE.md`.
 day09 run
 day09 validate
 ```
+
+`day09 run` tạo một Competition run mới trước khi gọi MCP để evidence và submission
+cùng audit scope. Không mở lại workspace hoặc tạo run khác trong lúc lệnh đang chạy.
+`day09 run --resume` giữ nguyên run hiện tại; cần resume và nộp bài trước thời điểm run
+hết hạn được in ở đầu lệnh.
+
+Nếu run bị ngắt, dùng `day09 run --resume`. Chỉ các case có output đúng contract và có
+event `case_finalized` mới được bỏ qua; trace của case đang chạy được ghi tạm rồi mới ghép
+vào trace chung để tránh làm hỏng toàn bộ tiến độ.
 
 Kết quả được tạo tại:
 
