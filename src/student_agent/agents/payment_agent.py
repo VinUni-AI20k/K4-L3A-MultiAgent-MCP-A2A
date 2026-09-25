@@ -310,29 +310,22 @@ class PaymentAgent:
         # ── D. Phát hiện duplicate charge từ timeline events ───────────────
         # Quy tắc: ≥ 2 lần "captured" cùng amount_brl, tổng > giá trị đơn → duplicate
         # Nếu tổng = giá trị đơn → valid_split_payment
+        # Không biết giá trị đơn thì không phân biệt được 30+30 (split) với 60+60
+        # (duplicate), nên không kết luận.
         duplicate_items: list[dict[str, Any]] = []
+        exp_total = _dec(expected_order_total) if expected_order_total is not None else None
 
-        if len(captured_events) >= 2:
+        if len(captured_events) >= 2 and exp_total is not None and captured_from_events > exp_total:
             # Nhóm các captured events theo amount_brl
             amount_counts: Counter[Decimal] = Counter()
             for evt in captured_events:
                 amt = _dec(evt.get("amount_brl") or evt.get("amount") or 0)
                 amount_counts[amt] += 1
 
-            # Nếu có ≥ 2 event cùng amount và tổng > giá trị đơn → duplicate
             for amt, cnt in amount_counts.items():
-                if cnt >= 2:
-                    total_for_amt = amt * cnt
-                    exp = (
-                        _dec(expected_order_total)
-                        if expected_order_total is not None
-                        else None
-                    )
-                    # duplicate: tổng > expected, hoặc không biết expected
-                    if exp is None or total_for_amt > exp:
-                        # Lần đầu là hợp lệ, lần sau là duplicate
-                        for _ in range(cnt - 1):
-                            duplicate_items.append({"ref": order_id, "amount": amt})
+                # Lần đầu là hợp lệ, lần sau là duplicate
+                for _ in range(cnt - 1):
+                    duplicate_items.append({"ref": order_id, "amount": amt})
 
         # Fallback: phát hiện duplicate từ get_order_payments (tương thích test cũ)
         if not duplicate_items and not captured_events:
@@ -433,10 +426,19 @@ class PaymentAgent:
                     ))
             # Nếu không tính được chênh lệch, không thêm refund line (verifier sẽ xử lý)
 
-        elif not has_mismatch_event and expected_order_total is not None:
-            # Fallback: so captured_total (từ get_order_payments) vs expected
-            expected_total = _dec(expected_order_total)
-            diff = captured_total - expected_total
+        elif captured_events:
+            # Có timeline: chỉ tin event "captured" (đã lọc theo khoảng thời gian case).
+            # Payment rows không có ngày nên lẫn bản ghi nhiễu, không dùng để so tổng.
+            if (
+                len(captured_events) >= 2
+                and exp_total is not None
+                and captured_from_events == exp_total
+            ):
+                detected_issue = "valid_split_payment"
+
+        elif exp_total is not None:
+            # Không có timeline: so captured_total (từ get_order_payments) vs expected
+            diff = captured_total - exp_total
             if diff > Decimal("0.01"):
                 detected_issue = "payment_mismatch"
                 refund_lines.append(RefundLine(
@@ -444,11 +446,8 @@ class PaymentAgent:
                     amount_brl=diff,
                     entity_id=order_id,
                 ))
-            elif len(payments) > 1 and captured_total == expected_total or len(payments) > 1:
+            elif len(payments) > 1 and captured_total == exp_total:
                 detected_issue = "valid_split_payment"
-
-        elif len(payments) > 1:
-            detected_issue = "valid_split_payment"
 
         # ── F. Xử lý đơn bị hủy / không khả dụng ─────────────────────────
         if order_status in {"canceled", "unavailable"}:

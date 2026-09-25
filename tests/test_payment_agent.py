@@ -55,7 +55,11 @@ def _assert_dod(result: PaymentInvestigationResult) -> None:
 class TestNoAction:
     def test_single_payment_delivered(self, agent: PaymentAgent) -> None:
         res = _r(agent,
-            payments=[{"payment_reference": "pay_001", "payment_type": "credit_card", "payment_value": 150.0}],
+            payments=[{
+                "payment_reference": "pay_001",
+                "payment_type": "credit_card",
+                "payment_value": 150.0,
+            }],
             expected_order_total=150.0,
             order_status="delivered",
         )
@@ -81,8 +85,16 @@ class TestNoAction:
 class TestValidSplitPayment:
     def test_voucher_plus_credit_card(self, agent: PaymentAgent) -> None:
         payments = [
-            {"payment_reference": "pay_vouch", "payment_type": "voucher",     "payment_value": 40.0},
-            {"payment_reference": "pay_cc",    "payment_type": "credit_card", "payment_value": 60.0},
+            {
+                "payment_reference": "pay_vouch",
+                "payment_type": "voucher",
+                "payment_value": 40.0,
+            },
+            {
+                "payment_reference": "pay_cc",
+                "payment_type": "credit_card",
+                "payment_value": 60.0,
+            },
         ]
         res = _r(agent, payments=payments, expected_order_total=100.0, order_status="delivered")
         assert res.detected_issue == "valid_split_payment"
@@ -108,7 +120,11 @@ class TestValidSplitPayment:
 
 class TestPaymentMismatch:
     def test_overcharge(self, agent: PaymentAgent) -> None:
-        payments = [{"payment_reference": "pay_mm", "payment_type": "credit_card", "payment_value": 125.75}]
+        payments = [{
+            "payment_reference": "pay_mm",
+            "payment_type": "credit_card",
+            "payment_value": 125.75,
+        }]
         res = _r(agent, payments=payments, expected_order_total=100.0, order_status="delivered")
         assert res.detected_issue == "payment_mismatch"
         fin = res.financial_resolution
@@ -120,7 +136,11 @@ class TestPaymentMismatch:
 
     def test_underpayment_no_refund(self, agent: PaymentAgent) -> None:
         # Underpayment không gây refund – để policy agent xử lý
-        payments = [{"payment_reference": "pay_under", "payment_type": "boleto", "payment_value": 80.0}]
+        payments = [{
+            "payment_reference": "pay_under",
+            "payment_type": "boleto",
+            "payment_value": 80.0,
+        }]
         res = _r(agent, payments=payments, expected_order_total=100.0, order_status="delivered")
         assert res.detected_issue not in {"payment_mismatch", "duplicate_charge"}
         assert res.financial_resolution["recommended_refund_brl"] == 0.0
@@ -134,8 +154,16 @@ class TestPaymentMismatch:
 class TestDuplicateCharge:
     def test_duplicate_credit_card_same_amount_as_expected(self, agent: PaymentAgent) -> None:
         payments = [
-            {"payment_reference": "pay_orig", "payment_type": "credit_card", "payment_value": 150.0},
-            {"payment_reference": "pay_dup",  "payment_type": "credit_card", "payment_value": 150.0},
+            {
+                "payment_reference": "pay_orig",
+                "payment_type": "credit_card",
+                "payment_value": 150.0,
+            },
+            {
+                "payment_reference": "pay_dup",
+                "payment_type": "credit_card",
+                "payment_value": 150.0,
+            },
         ]
         res = _r(agent, payments=payments, expected_order_total=150.0, order_status="delivered")
         assert res.detected_issue == "duplicate_charge"
@@ -167,7 +195,11 @@ class TestDuplicateCharge:
 
 class TestRefundFailed:
     def test_failed_refund_triggers_retry_line(self, agent: PaymentAgent) -> None:
-        payments = [{"payment_reference": "pay_fail", "payment_type": "credit_card", "payment_value": 80.0}]
+        payments = [{
+            "payment_reference": "pay_fail",
+            "payment_type": "credit_card",
+            "payment_value": 80.0,
+        }]
         refunds  = [{"refund_id": "ref_fail_01", "status": "failed", "amount": 80.0}]
         res = _r(agent, payments=payments, refund_timeline=refunds,
                  expected_order_total=80.0, order_status="canceled")
@@ -191,7 +223,11 @@ class TestRefundFailed:
 
 class TestRefundPending:
     def test_pending_refund_expedite_line(self, agent: PaymentAgent) -> None:
-        payments = [{"payment_reference": "pay_pend", "payment_type": "credit_card", "payment_value": 60.0}]
+        payments = [{
+            "payment_reference": "pay_pend",
+            "payment_type": "credit_card",
+            "payment_value": 60.0,
+        }]
         refunds  = [{"refund_id": "ref_pend_01", "status": "pending", "amount": 60.0}]
         res = _r(agent, payments=payments, refund_timeline=refunds,
                  expected_order_total=60.0, order_status="canceled")
@@ -214,7 +250,11 @@ class TestRefundPending:
 
 class TestCanceledOrder:
     def test_canceled_order_triggers_full_refund(self, agent: PaymentAgent) -> None:
-        payments = [{"payment_reference": "pay_cancel", "payment_type": "boleto", "payment_value": 200.0}]
+        payments = [{
+            "payment_reference": "pay_cancel",
+            "payment_type": "boleto",
+            "payment_value": 200.0,
+        }]
         res = _r(agent, payments=payments, expected_order_total=200.0, order_status="canceled")
         fin = res.financial_resolution
         assert fin["recommended_refund_brl"] == 200.0
@@ -222,7 +262,11 @@ class TestCanceledOrder:
         _assert_dod(res)
 
     def test_canceled_order_already_refunded_no_action(self, agent: PaymentAgent) -> None:
-        payments = [{"payment_reference": "pay_done", "payment_type": "credit_card", "payment_value": 100.0}]
+        payments = [{
+            "payment_reference": "pay_done",
+            "payment_type": "credit_card",
+            "payment_value": 100.0,
+        }]
         refunds  = [{"refund_id": "ref_done", "status": "completed", "amount": 100.0}]
         res = _r(agent, payments=payments, refund_timeline=refunds, order_status="canceled")
         # Đã hoàn đủ rồi → refund_lines rỗng
@@ -271,7 +315,11 @@ class TestDoD:
 class TestPaymentReferences:
     def test_max_20_references(self, agent: PaymentAgent) -> None:
         payments = [
-            {"payment_reference": f"pay_{i:03d}", "payment_type": "credit_card", "payment_value": 1.0}
+            {
+                "payment_reference": f"pay_{i:03d}",
+                "payment_type": "credit_card",
+                "payment_value": 1.0,
+            }
             for i in range(25)
         ]
         res = _r(agent, payments=payments)
@@ -284,3 +332,55 @@ class TestPaymentReferences:
         ]
         res = _r(agent, payments=payments)
         assert res.payment_references.count("pay_same") == 1
+
+
+# ---------------------------------------------------------------------------
+# 9. Dữ liệu thật: payment rows lẫn bản ghi nhiễu, chỉ tin event "captured"
+# ---------------------------------------------------------------------------
+
+def _captured(*amounts: str) -> list[dict]:
+    return [
+        {"event_type": "captured", "amount_brl": a, "status": "confirmed"} for a in amounts
+    ]
+
+
+# Payment rows thật + 1 dòng nhiễu (không có ngày nên không lọc được).
+_ROWS_WITH_NOISE = [
+    {"payment_sequential": "1", "payment_type": "credit_card", "payment_value": "60.00"},
+    {"payment_sequential": "1", "payment_type": "credit_card", "payment_value": "7.00"},
+]
+
+
+class TestTimelineBased:
+    def test_single_capture_with_noise_row_is_not_split(self, agent: PaymentAgent) -> None:
+        res = _r(agent, payments=_ROWS_WITH_NOISE, payment_events=_captured("60.00"),
+                 expected_order_total="60.00", order_status="delivered")
+        assert res.detected_issue is None
+
+    def test_equal_split_matching_total_is_split_not_duplicate(
+        self, agent: PaymentAgent
+    ) -> None:
+        res = _r(agent, payments=_ROWS_WITH_NOISE, payment_events=_captured("30.00", "30.00"),
+                 expected_order_total="60.00", order_status="delivered")
+        assert res.detected_issue == "valid_split_payment"
+        assert res.financial_resolution["recommended_refund_brl"] == 0.0
+
+    def test_repeated_capture_over_total_is_duplicate(self, agent: PaymentAgent) -> None:
+        res = _r(agent, payments=_ROWS_WITH_NOISE, payment_events=_captured("60.00", "60.00"),
+                 expected_order_total="60.00", order_status="delivered")
+        assert res.detected_issue == "duplicate_charge"
+        assert res.financial_resolution["recommended_refund_brl"] == 60.0
+        _assert_dod(res)
+
+    def test_unknown_total_gives_no_split_or_duplicate(self, agent: PaymentAgent) -> None:
+        # 30+30 (split) và 60+60 (duplicate) không phân biệt được nếu thiếu giá trị đơn
+        for events in (_captured("30.00", "30.00"), _captured("60.00", "60.00")):
+            res = _r(agent, payments=_ROWS_WITH_NOISE, payment_events=events,
+                     order_status="delivered")
+            assert res.detected_issue is None
+
+    def test_row_totals_ignored_when_timeline_exists(self, agent: PaymentAgent) -> None:
+        # Rows cộng ra 67.00 (có dòng nhiễu) nhưng timeline chỉ có 60.00 → không mismatch
+        res = _r(agent, payments=_ROWS_WITH_NOISE, payment_events=_captured("60.00"),
+                 expected_order_total="60.00", order_status="delivered")
+        assert res.detected_issue != "payment_mismatch"
