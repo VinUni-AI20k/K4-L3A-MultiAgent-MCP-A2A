@@ -1,7 +1,67 @@
 # Phụ lục tối ưu điểm — dùng kèm bảng phân công cũ
 
 > **Không đổi ai làm gì.** Bảng phân công cũ vẫn giữ nguyên. File này bổ sung những thứ bảng cũ còn thiếu: tên tool MCP thật, "hợp đồng" trả kết quả cho coordinator, và cách tinh chỉnh để tăng điểm.
-> Code tham chiếu: branch `feat/tv1-coordinator-trace` (TV1).
+> Code tham chiếu: `main` (đã tích hợp code của cả 5 người).
+
+---
+
+## 0. Đọc trước: những gì dữ liệu MCP thật cho thấy (25/09)
+
+Lấy mẫu 10 case (mỗi topic 1 case), gọi đủ tool. Có 3 phát hiện quyết định điểm:
+
+**a) Dữ liệu có bản ghi "nhiễu" ngoài dòng thời gian của case.** Mỗi tool trả cả bản ghi thật của case lẫn bản ghi nằm **trước ngày mua** hoặc **sau `opened_at`**. Ví dụ:
+- refund `failed` từ 3 tháng trước;
+- sự kiện `delivered_late` xảy ra sau khi case đã mở;
+- khoản `captured` thuộc về một đơn khác thời điểm.
+
+→ Chỉ tin bản ghi có thời gian trong khoảng `[order_purchase_timestamp − 1 ngày, opened_at]`. Khi lọc như vậy, evidence khớp đúng issue ở **10/10 case**; nếu không lọc thì bị lừa ở ít nhất 5/10 case.
+
+**b) Policy là chung cho mọi case.** `get_policy` trả các `rules` theo từng issue: `case_status`, `recommended_action`, `refund_brl`, `responsible_parties`. Chọn đúng issue thì tiền, hành động và trạng thái lấy thẳng từ rule. Lưu ý: `party_id` của seller trong rule chỉ là **ví dụ**, phải thay bằng seller thật của case.
+
+**c) Mỗi issue có dấu hiệu tường minh (trong khoảng thời gian trên):**
+
+| Issue | Dấu hiệu |
+| --- | --- |
+| `canceled_order_paid` / `unavailable_order_paid` | `get_order.order_status` = `canceled` / `unavailable` + có `captured` |
+| `refund_pending` / `refund_failed` | `get_refund_timeline.events[].status` = `pending` / `failed` |
+| `payment_mismatch` | `get_payment_timeline.events[]` có `reconciliation_mismatch` |
+| `duplicate_charge` | ≥ 2 lần `captured` cùng số tiền, tổng > giá trị đơn (price + freight) |
+| `valid_split_payment` | ≥ 2 lần `captured`, tổng = giá trị đơn |
+| `late_delivery_seller` | `delivered_customer_at > estimated_delivery_at` **và** `delivered_carrier_at > shipping_limit_at` |
+| `late_delivery_logistics` | giao trễ nhưng seller bàn giao đúng hạn |
+| `unsupported_claim` | đã kiểm tra order + payment + shipment mà không thấy vấn đề |
+
+Cài đặt: `src/student_agent/agents/evidence_rules.py` (TV1).
+
+### Tên field thật (code hiện tại đang đoán sai)
+
+| Tool | Cấu trúc `data` thật |
+| --- | --- |
+| `get_order` | dict: `order_status`, `order_purchase_timestamp`, `order_delivered_carrier_date`, `order_delivered_customer_date`, `order_estimated_delivery_date`, `customer_id` (**không có** `customer_unique_id`) |
+| `get_order_items` | list: `order_item_id`, `product_id`, `seller_id`, `shipping_limit_date`, `price`, `freight_value` (chuỗi số) |
+| `get_order_payments` | list: `payment_sequential`, `payment_type`, `payment_installments`, `payment_value` (không có ngày) |
+| `get_payment_timeline` | dict: `payments` (như trên) + `events[]`: `event_at`, `event_type` (`captured`, `reconciliation_mismatch`), `amount_brl`, `status` |
+| `get_refund_timeline` | dict: `events[]`: `event_at`, `event_type=refund_requested`, `amount_brl`, `status`. **Tool trả lỗi khi đơn không có refund**, nên phải bắt exception |
+| `get_shipment_summary` | dict: `order_status`, `delivered_carrier_at`, `delivered_customer_at`, `estimated_delivery_at`, `shipping_limits[]` (`seller_id`, `shipping_limit_at`), `events[]` (`event_type=delivered_late`, `actor`) |
+| `get_sellers` | list: `seller_id`, `seller_city`, `seller_state` — tham số là **`order_id`** |
+
+### Việc từng người nên sửa trong file của mình
+
+Coordinator đã có adapter nên pipeline vẫn chạy đúng khi chưa sửa. Sửa xong thì tín hiệu của từng agent sẽ khớp với evidence rules.
+
+- **TV2 (order_agent.py):**
+  - `get_product_context` cần `order_id`, không phải `product_id`.
+  - `get_customer_history` cần `customer_unique_id`, mà `get_order` không trả trường này, nên bỏ lời gọi đó.
+  - Còn 4 dòng quá 100 ký tự (CI đỏ).
+- **TV3 (shipment_agent.py):**
+  - Đổi tên field theo bảng trên (`delivered_carrier_at`, `estimated_delivery_at`, `shipping_limits[].shipping_limit_at`...).
+  - `get_sellers` cần `order_id`.
+  - Lọc bản ghi theo khoảng thời gian của case.
+- **TV4 (payment_agent.py):**
+  - Timeline và refund nằm trong key `events`, không phải `timeline`/`refunds`; số tiền ở `amount_brl`.
+  - Bọc `get_refund_timeline` bằng try/except.
+  - `test_floating_point_sum_is_exact` đang fail vì cộng float.
+- **TV5:** policy/verifier dùng tốt. Coordinator đã thay seller ví dụ trong policy bằng seller thật trước khi gọi `verify`.
 
 ---
 
