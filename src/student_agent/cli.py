@@ -14,6 +14,8 @@ from .submission import package_submission, validate_artifacts
 from .trace import TraceWriter
 from .workflow import solve_case
 
+BATCH_ATTEMPTS = 5
+
 
 def _root(value: str) -> Path:
     return Path(value).resolve()
@@ -27,7 +29,32 @@ async def _show_tools(root: Path) -> None:
             print(tool)
 
 
-async def _run(root: Path) -> None:
+def _is_transport_error(exc: BaseException) -> bool:
+    nested = getattr(exc, "exceptions", ())
+    if nested:
+        return any(_is_transport_error(item) for item in nested)
+    cause = exc.__cause__ or exc.__context__
+    if cause is not None and cause is not exc and _is_transport_error(cause):
+        return True
+    module = type(exc).__module__
+    if module.startswith(("httpx2", "httpcore2", "anyio")) or isinstance(
+        exc, (ConnectionError, TimeoutError)
+    ):
+        return True
+    message = str(exc).lower()
+    return isinstance(exc, RuntimeError) and any(
+        marker in message
+        for marker in (
+            "mcp tool",
+            "required tool",
+            "gateway",
+            "connection",
+            "timed out",
+        )
+    )
+
+
+async def _run_attempt(root: Path, limit: int | None = None) -> None:
     settings = Settings.load(root)
     case_set = load_case_set(root)
     contracts = Contracts(root / "contracts" / "schemas")
@@ -44,7 +71,10 @@ async def _run(root: Path) -> None:
         discovered_tools = await gateway.list_tools()
         if not discovered_tools:
             raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
+        selected_case_ids = (
+            case_set.case_ids[:limit] if limit is not None else case_set.case_ids
+        )
+        for case_id in selected_case_ids:
             case = case_set.cases[case_id]
             trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
             output = await solve_case(case, gateway, trace)
@@ -60,13 +90,36 @@ async def _run(root: Path) -> None:
             trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
 
 
+async def _run(root: Path, limit: int | None = None) -> None:
+    for attempt in range(1, BATCH_ATTEMPTS + 1):
+        try:
+            await _run_attempt(root, limit)
+            return
+        except Exception as exc:
+            if not _is_transport_error(exc) or attempt == BATCH_ATTEMPTS:
+                raise
+            print(
+                f"WARN: MCP transport failed; restarting clean batch "
+                f"({attempt}/{BATCH_ATTEMPTS})",
+                file=sys.stderr,
+            )
+            await asyncio.sleep(float(attempt))
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Day09 L3A student workflow")
     result.add_argument("--root", default=".", help="repository root (default: current directory)")
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("validate-inputs", help="validate case-set.json and all 100 inputs")
     commands.add_parser("mcp-tools", help="authenticate and list discovered MCP tools")
-    commands.add_parser("run", help="run the implemented workflow for all cases")
+    run = commands.add_parser("run", help="run the implemented workflow for all cases")
+    run.add_argument(
+        "--limit",
+        type=int,
+        choices=range(1, 101),
+        metavar="N",
+        help="run only the first N cases (smoke testing only)",
+    )
     commands.add_parser("validate", help="validate outputs and observable trace")
     package = commands.add_parser("package", help="validate and build the submission ZIP")
     package.add_argument("--output", default="dist/submission.zip")
@@ -86,7 +139,7 @@ def main() -> None:
         elif args.command == "mcp-tools":
             asyncio.run(_show_tools(root))
         elif args.command == "run":
-            asyncio.run(_run(root))
+            asyncio.run(_run(root, args.limit))
         elif args.command == "validate":
             case_set = load_case_set(root)
             contracts = Contracts(root / "contracts" / "schemas")

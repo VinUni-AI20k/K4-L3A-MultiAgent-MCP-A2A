@@ -18,6 +18,7 @@ htmlcov/
 
 # Competition runtime artifacts
 case-set.json
+l3a-inputs-v1/
 inputs/*
 !inputs/.gitkeep
 outputs/*
