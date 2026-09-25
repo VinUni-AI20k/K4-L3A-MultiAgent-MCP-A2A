@@ -147,9 +147,12 @@ Hoàn thiện mô tả thiết kế trong `ARCHITECTURE.md`.
 ## 6. Chạy và kiểm tra
 
 ```bash
-day09 run
+day09 run --concurrency 10
 day09 validate
 ```
+
+`--concurrency` schedules independent case workers. MCP requests share a limit of two
+in-flight calls because the team endpoint becomes unreliable above that level.
 
 Kết quả được tạo tại:
 

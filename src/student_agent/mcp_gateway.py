@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -15,9 +16,15 @@ CONNECT_RETRIES = 5
 
 
 class EvidenceGateway:
-    def __init__(self, session: ClientSession, contracts: Contracts) -> None:
+    def __init__(
+        self,
+        session: ClientSession,
+        contracts: Contracts,
+        limiter: asyncio.Semaphore | None = None,
+    ) -> None:
         self._session = session
         self._contracts = contracts
+        self._limiter = limiter
 
     async def list_tools(self) -> list[str]:
         response = await self._session.list_tools()
@@ -38,6 +45,12 @@ class EvidenceGateway:
         )
 
     async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+        if self._limiter is not None:
+            async with self._limiter:
+                return await self._call(tool_name, case_id=case_id, **arguments)
+        return await self._call(tool_name, case_id=case_id, **arguments)
+
+    async def _call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
         result = await self._session.call_tool(tool_name, arguments=payload)
         if result.is_error:
@@ -59,7 +72,10 @@ class EvidenceGateway:
 
 @asynccontextmanager
 async def connect_gateway(
-    endpoint: str, team_api_key: str, contracts: Contracts
+    endpoint: str,
+    team_api_key: str,
+    contracts: Contracts,
+    limiter: asyncio.Semaphore | None = None,
 ) -> AsyncIterator[EvidenceGateway]:
     headers = {"Authorization": f"Bearer {team_api_key}"}
     timeout = httpx2.Timeout(300.0, connect=30.0, write=30.0, pool=30.0)
@@ -75,4 +91,4 @@ async def connect_gateway(
         ClientSession(read_stream, write_stream) as session,
     ):
         await session.initialize()
-        yield EvidenceGateway(session, contracts)
+        yield EvidenceGateway(session, contracts, limiter)

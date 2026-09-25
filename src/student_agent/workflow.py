@@ -63,6 +63,18 @@ MAX_ATTEMPTS = 3
 RETRY_BASE_SECONDS = 1.0
 
 
+def _entity_ids(rows: list[dict[str, Any]], *keys: str) -> list[str]:
+    values = {
+        str(row[key])
+        for row in rows
+        for key in keys
+        if isinstance(row.get(key), (str, int))
+        and not isinstance(row.get(key), bool)
+        and str(row[key])
+    }
+    return sorted(values)
+
+
 class EvidenceUnavailable(Exception):
     """The gateway answered that the requested evidence does not exist for this scope."""
 
@@ -147,6 +159,11 @@ class OrderAgent(Agent):
             raise EvidenceUnavailable("order has no usable purchase/opened window")
         window = Window(start, end)
         items = await self.fetch("items", "get_order_items", order_id=self.context.order_id)
+        items = [
+            item
+            for item in items or []
+            if item.get("order_id", self.context.order_id) == self.context.order_id
+        ]
         in_window, dropped = split_in_window(items or [], "shipping_limit_date", window)
         kept, repeated = one_row_per_item(in_window)
         return {
@@ -170,17 +187,29 @@ class PaymentAgent(Agent):
         timeline = await self.fetch(
             "payment", "get_payment_timeline", order_id=self.context.order_id
         )
-        events, dropped_payments = split_in_window(timeline.get("events") or [], "event_at", window)
+        events = [
+            event
+            for event in timeline.get("events") or []
+            if event.get("order_id", self.context.order_id) == self.context.order_id
+        ]
+        events, dropped_payments = split_in_window(events, "event_at", window)
         try:
             refund = await self.fetch(
                 "refund", "get_refund_timeline", order_id=self.context.order_id
             )
-            refund_events = refund.get("events") or []
+            refund_events = [
+                event
+                for event in refund.get("events") or []
+                if event.get("order_id", self.context.order_id) == self.context.order_id
+            ]
         except EvidenceUnavailable:
             refund_events = []
         refunds, dropped_refunds = split_in_window(refund_events, "event_at", window)
         return {
             "captures": [event for event in events if event.get("event_type") == "captured"],
+            "payment_references": _entity_ids(
+                events, "payment_id", "payment_reference", "transaction_id"
+            ),
             "mismatches": [
                 event for event in events if event.get("event_type") == "reconciliation_mismatch"
             ],
@@ -198,12 +227,18 @@ class ShipmentAgent(Agent):
         summary = await self.fetch(
             "shipment", "get_shipment_summary", order_id=self.context.order_id
         )
-        events, dropped = split_in_window(summary.get("events") or [], "event_at", window)
+        events = [
+            event
+            for event in summary.get("events") or []
+            if event.get("order_id", self.context.order_id) == self.context.order_id
+        ]
+        events, dropped = split_in_window(events, "event_at", window)
         return {
             "delivered_carrier_at": parse_time(summary.get("delivered_carrier_at")),
             "delivered_customer_at": parse_time(summary.get("delivered_customer_at")),
             "estimated_delivery_at": parse_time(summary.get("estimated_delivery_at")),
             "events": events,
+            "shipment_ids": _entity_ids(events, "shipment_id"),
             "excluded_shipment_events": dropped,
         }
 
@@ -263,9 +298,11 @@ class Coordinator:
         facts.order_status = order_report["order"].get("order_status")
         facts.items = order_report["items"]
         facts.captures = payment_report["captures"]
+        facts.payment_references = payment_report["payment_references"]
         facts.mismatches = payment_report["mismatches"]
         facts.refunds = payment_report["refunds"]
         facts.shipment_events = shipment_report["events"]
+        facts.shipment_ids = shipment_report["shipment_ids"]
         facts.delivered_carrier_at = shipment_report["delivered_carrier_at"]
         facts.delivered_customer_at = shipment_report["delivered_customer_at"]
         facts.estimated_delivery_at = shipment_report["estimated_delivery_at"]
@@ -419,8 +456,8 @@ def build_output(context: CaseContext, decision: dict[str, Any]) -> dict[str, An
             "order_ids": [facts.order_id],
             "item_ids": facts.item_ids,
             "seller_ids": facts.seller_ids,
-            "payment_references": [],
-            "shipment_ids": [],
+            "payment_references": facts.payment_references,
+            "shipment_ids": facts.shipment_ids,
         },
         "claim_assessments": claim_assessments,
         "root_cause_analysis": {

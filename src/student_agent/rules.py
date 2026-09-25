@@ -67,6 +67,8 @@ class Facts:
     mismatches: list[dict[str, Any]] = field(default_factory=list)
     refunds: list[dict[str, Any]] = field(default_factory=list)
     shipment_events: list[dict[str, Any]] = field(default_factory=list)
+    payment_references: list[str] = field(default_factory=list)
+    shipment_ids: list[str] = field(default_factory=list)
     delivered_carrier_at: datetime | None = None
     delivered_customer_at: datetime | None = None
     estimated_delivery_at: datetime | None = None

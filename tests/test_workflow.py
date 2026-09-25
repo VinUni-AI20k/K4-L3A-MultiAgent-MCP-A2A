@@ -195,6 +195,31 @@ def test_trace_covers_workflow_and_links_cited_evidence(tmp_path: Path) -> None:
     assert verification["decision_code"] == "PASS"
 
 
+def test_payment_and_shipment_ids_are_limited_to_in_window_order_evidence(
+    tmp_path: Path,
+) -> None:
+    inside_capture = event(INSIDE, "captured", "89.00")
+    inside_capture["payment_reference"] = "pay-inside"
+    outside_capture = event(OUTSIDE, "captured", "35.00")
+    outside_capture["payment_reference"] = "pay-outside"
+    data = scenario(
+        get_payment_timeline={"events": [inside_capture, outside_capture]},
+        get_shipment_summary={
+            "delivered_carrier_at": "2018-01-12T09:00:00-03:00",
+            "delivered_customer_at": "2018-01-18T09:00:00-03:00",
+            "estimated_delivery_at": "2018-01-20T09:00:00-03:00",
+            "events": [
+                {"event_at": INSIDE, "shipment_id": "ship-inside"},
+                {"event_at": OUTSIDE, "shipment_id": "ship-outside"},
+            ],
+        },
+    )
+    output, _, _ = run(data, "unsupported_claim", tmp_path)
+    entities = output["affected_entities"]
+    assert entities["payment_references"] == ["pay-inside"]
+    assert entities["shipment_ids"] == ["ship-inside"]
+
+
 @pytest.mark.parametrize(
     ("captures", "expected"),
     [

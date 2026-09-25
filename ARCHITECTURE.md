@@ -49,6 +49,8 @@ Quyền gọi tool (`TOOL_GRANTS`, kiểm tra khi chạy, sai quyền → `Permi
 | shipment-agent | `get_shipment_summary` |
 | policy-agent | `get_policy` |
 
+Gateway luôn thêm `case_id`. Các order scoped tools nhận `order_id`: `get_order`, `get_order_items`, `get_sellers`, `get_payment_timeline`, `get_refund_timeline`, `get_shipment_summary`. `get_policy` nhận `policy_version`. `day09 mcp-tools` in live input schemas khi endpoint khả dụng.
+
 Không gọi `get_order_payments` (dòng payment không có timestamp nên không lọc được mồi; `get_payment_timeline` đã chứa cùng dữ liệu kèm event), `get_product_context` (không ảnh hưởng quyết định) và `get_customer_history` (order không trả `customer_unique_id`).
 
 ## 3. A2A protocol
@@ -64,7 +66,7 @@ Không gọi `get_order_payments` (dòng payment không có timestamp nên khôn
 
 1. `EvidenceGateway.call` validate response theo `mcp-evidence-response-v1`.
 2. `Agent.fetch` lưu `evidence_ref` vào `CaseContext.refs[group]` và ledger `ref → case_id`, rồi emit `tool_result_consumed` (actor, tool, ref, domain).
-3. Output chỉ trích dẫn ref trong ledger, theo nhóm evidence gắn với `primary_issue` (`CITATIONS`). Ví dụ: `late_delivery_seller` → order, items, sellers, shipment, policy. Claim `requested_full_refund` → payment, refund, policy.
+3. Output chỉ trích dẫn ref trong ledger, theo nhóm evidence gắn với `primary_issue` (`CITATIONS`). Ví dụ: `late_delivery_seller` → order, items, sellers, shipment, policy. Claim `requested_full_refund` → payment, refund, policy. Payment references chỉ lấy từ capture events trong case window; shipment IDs chỉ lấy từ shipment events trong window.
 4. Ref không bao giờ được tạo, sửa hoặc dùng lại giữa các case; mỗi lần `day09 run` sinh ref mới, nên bài nộp phải lấy từ một lần chạy đầy đủ.
 
 ## 5. Failure policy
@@ -118,7 +120,7 @@ Chọn `primary_issue`: nếu issue trong claim đầu tiên được dữ liệ
 
 - Không dùng LLM; quyết định deterministic, không có random seed (chỉ `event_id` của trace là ngẫu nhiên).
 - Python ≥ 3.11 (đã chạy với 3.12); dependency theo khoảng version trong `pyproject.toml`.
-- Các case chạy tuần tự; trong một case, payment và shipment chạy song song (tối đa 2 call đồng thời).
+- Tối đa 10 case worker chạy song song; mỗi worker có MCP session riêng và mọi request dùng chung semaphore tối đa 2 call đồng thời.
 - Mỗi case gọi 6 tool, thêm `get_sellers` khi bên chịu trách nhiệm là seller.
-- Lệnh: `day09 run && day09 validate && day09 package --output dist/submission.zip`.
+- Output và trace được tạo trong thư mục tạm; chỉ promote sau khi đủ 100 case, contract hợp lệ và health guard không thấy lỗi evidence hàng loạt. Lệnh: `day09 run --concurrency 10 && day09 validate && day09 package --output dist/submission.zip`.
 - Test offline: `pytest -q tests/test_workflow.py` (dùng gateway giả, không gọi mạng).
