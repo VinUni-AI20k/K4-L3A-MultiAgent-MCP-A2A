@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .graph import build_case_graph
 from .mcp_gateway import EvidenceGateway
 from .trace import TraceWriter
 
@@ -9,10 +10,9 @@ from .trace import TraceWriter
 async def solve_case(
     case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter
 ) -> dict[str, Any]:
-    """Implement the L3A coordinator and specialist-agent workflow here.
-
-    The starter kit intentionally does not generate a fallback answer: submitting an
-    invented answer or evidence reference would violate the competition contract.
-    """
-    del case, gateway, trace
-    raise NotImplementedError("Implement the L3A multi-agent workflow in solve_case()")
+    """Run one bounded LangGraph investigation and return its verified output."""
+    case_id = str(case["case_id"])
+    final_state = await build_case_graph().ainvoke(
+        {"case": case, "case_id": case_id, "gateway": gateway, "trace": trace}
+    )
+    return final_state["output"]
