@@ -9,6 +9,15 @@ from referencing import Registry, Resource
 
 from . import VARIANT_ID
 
+PUBLIC_SCHEMA_FILES = frozenset(
+    {
+        "l3a-output-v2.schema.json",
+        "trace-event-v1.schema.json",
+        "submission-manifest-v2.schema.json",
+        "mcp-evidence-response-v1.schema.json",
+    }
+)
+
 
 class ContractError(ValueError):
     pass
@@ -24,6 +33,9 @@ class Contracts:
             schemas[path.name] = schema
             resource = Resource.from_contents(schema)
             registry = registry.with_resource(schema["$id"], resource)
+        missing = sorted(PUBLIC_SCHEMA_FILES - schemas.keys())
+        if missing:
+            raise ContractError(f"missing public contract schema(s): {', '.join(missing)}")
         self._schemas = schemas
         self._registry = registry
 
