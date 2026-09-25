@@ -23,8 +23,8 @@ async def _show_tools(root: Path) -> None:
     settings = Settings.load(root)
     contracts = Contracts(root / "contracts" / "schemas")
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        for tool in await gateway.list_tools():
-            print(tool)
+        for tool in await gateway.describe_tools():
+            print(json.dumps(tool, ensure_ascii=False))
 
 
 async def _run(root: Path) -> None:
