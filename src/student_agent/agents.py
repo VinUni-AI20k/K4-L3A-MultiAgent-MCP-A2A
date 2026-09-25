@@ -200,29 +200,46 @@ class Decision:
     relevant_domains: tuple[str, ...] = ()
 
 
+def _iter_records(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, list):
+        return [r for r in data if isinstance(r, dict)]
+    if isinstance(data, dict):
+        for key in ("items", "payments", "records", "rows", "events", "timeline"):
+            candidate = data.get(key)
+            if isinstance(candidate, list):
+                return [r for r in candidate if isinstance(r, dict)]
+        return [data]
+    return []
+
+
 def _order_status(order_items: list[Any]) -> str | None:
     for item in order_items:
-        status = _get(item.data, "order_status", "status")
-        if isinstance(status, str):
-            return status.lower()
+        for rec in _iter_records(item.data):
+            status = _get(rec, "order_status", "status")
+            if isinstance(status, str):
+                return status.lower()
     return None
 
 
 def _payment_total(payment_items: list[Any]) -> float | None:
-    values = [
-        _as_number(_get(item.data, "payment_value", "amount", "value")) for item in payment_items
-    ]
-    values = [value for value in values if value is not None]
-    return sum(values) if values else None
+    total = 0.0
+    found = False
+    for item in payment_items:
+        for rec in _iter_records(item.data):
+            val = _as_number(_get(rec, "payment_value", "amount", "value", "total_paid"))
+            if val is not None:
+                total += val
+                found = True
+    return total if found else None
 
 
 def _duplicate_payment_amount(payment_items: list[Any]) -> float | None:
     seen: dict[float, int] = {}
     for item in payment_items:
-        amount = _as_number(_get(item.data, "payment_value", "amount", "value"))
-        if amount is None:
-            continue
-        seen[amount] = seen.get(amount, 0) + 1
+        for rec in _iter_records(item.data):
+            amount = _as_number(_get(rec, "payment_value", "amount", "value"))
+            if amount is not None and amount > 0:
+                seen[amount] = seen.get(amount, 0) + 1
     for amount, count in seen.items():
         if count > 1:
             return amount
@@ -231,42 +248,89 @@ def _duplicate_payment_amount(payment_items: list[Any]) -> float | None:
 
 def _refund_status(refund_items: list[Any]) -> str | None:
     for item in refund_items:
-        status = _get(item.data, "refund_status", "status")
-        if isinstance(status, str):
-            return status.lower()
+        for rec in _iter_records(item.data):
+            status = _get(rec, "refund_status", "status")
+            if isinstance(status, str):
+                return status.lower()
     return None
 
 
 def _item_total(item_items: list[Any]) -> float | None:
-    values = [_as_number(_get(item.data, "price", "item_price")) for item in item_items]
-    values = [value for value in values if value is not None]
-    return sum(values) if values else None
+    total = 0.0
+    found = False
+    for item in item_items:
+        for rec in _iter_records(item.data):
+            price = _as_number(_get(rec, "price", "item_price"))
+            freight = _as_number(_get(rec, "freight_value", "freight", "shipping_fee")) or 0.0
+            if price is not None:
+                total += price + freight
+                found = True
+    return total if found else None
 
 
-def _shipment_delay(shipment_items: list[Any], order_items: list[Any]) -> str | None:
+def _shipment_delay(
+    shipment_items: list[Any], order_items: list[Any], item_items: list[Any] | None = None
+) -> str | None:
     """Return 'seller' | 'logistics' | None (on-time or unknown)."""
     delivered_at = None
     estimated_at = None
+    carrier_at = None
+    shipping_limit = None
     shipped_after_limit = None
+
+    all_shipment_records = []
     for item in shipment_items:
-        delivered_at = delivered_at or _get(item.data, "delivered_at", "delivery_date")
-        shipped_after_limit = (
-            shipped_after_limit
-            if shipped_after_limit is not None
-            else _get(item.data, "shipped_after_limit")
-        )
+        all_shipment_records.extend(_iter_records(item.data))
+
+    all_order_records = []
     for item in order_items:
+        all_order_records.extend(_iter_records(item.data))
+
+    if item_items:
+        for item in item_items:
+            all_order_records.extend(_iter_records(item.data))
+
+    for rec in all_shipment_records:
+        delivered_at = delivered_at or _get(
+            rec, "delivered_at", "delivery_date", "order_delivered_customer_date"
+        )
+        carrier_at = carrier_at or _get(
+            rec,
+            "order_delivered_carrier_date",
+            "carrier_date",
+            "shipped_at",
+            "carrier_handover_date",
+        )
         estimated_at = estimated_at or _get(
-            item.data, "order_estimated_delivery_date", "estimated_delivery_date"
+            rec, "order_estimated_delivery_date", "estimated_delivery_date"
+        )
+        shipping_limit = shipping_limit or _get(
+            rec, "shipping_limit_date", "seller_shipping_limit", "limit_date"
+        )
+        if shipped_after_limit is None:
+            shipped_after_limit = _get(rec, "shipped_after_limit")
+
+    for rec in all_order_records:
+        estimated_at = estimated_at or _get(
+            rec, "order_estimated_delivery_date", "estimated_delivery_date"
         )
         delivered_at = delivered_at or _get(
-            item.data, "order_delivered_customer_date", "delivered_at"
+            rec, "order_delivered_customer_date", "delivered_at"
         )
+        carrier_at = carrier_at or _get(
+            rec, "order_delivered_carrier_date", "carrier_date", "shipped_at"
+        )
+        shipping_limit = shipping_limit or _get(
+            rec, "shipping_limit_date", "seller_shipping_limit"
+        )
+
     if not delivered_at or not estimated_at:
         return None
-    if delivered_at <= estimated_at:
+    if str(delivered_at) <= str(estimated_at):
         return None
     if shipped_after_limit is True:
+        return "seller"
+    if carrier_at and shipping_limit and str(carrier_at) > str(shipping_limit):
         return "seller"
     return "logistics"
 
@@ -283,7 +347,7 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
     item_total = _item_total(item_items)
     duplicate_amount = _duplicate_payment_amount(payment_items)
     refund_status = _refund_status(refund_items)
-    delay_owner = _shipment_delay(shipment_items, order_items)
+    delay_owner = _shipment_delay(shipment_items, order_items, item_items)
 
     order_id = order_items[0].entity_id if order_items else None
     seller_items = bundle.by_domain("seller")
