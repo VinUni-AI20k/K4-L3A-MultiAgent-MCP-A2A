@@ -10,13 +10,15 @@ from typing import Any
 import httpx2
 from mcp.shared.exceptions import MCPError
 
-from .cases import load_case_set
+import httpx
+
+from .cases import CaseSet, load_case_set
 from .config import Settings
 from .contracts import Contracts
 from .mcp_gateway import MCPTransportError, connect_gateway
 from .submission import package_submission, validate_artifacts
 from .trace import TraceWriter
-from .workflow import solve_case
+from .workflow import AgentModels, solve_case
 
 SESSION_CHUNK_SIZE = 10
 CASE_RETRY_ERRORS = (
@@ -32,13 +34,39 @@ def _root(value: str) -> Path:
     return Path(value).resolve()
 
 
-async def _show_tools(root: Path) -> None:
+async def _show_tools(root: Path, *, as_json: bool = False) -> None:
     settings = Settings.load(root)
     contracts = Contracts(root / "contracts" / "schemas")
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        for tool in await gateway.list_tools():
-            print(tool)
+        if as_json:
+            print(json.dumps(await gateway.describe_tools(), ensure_ascii=False, indent=2))
+        else:
+            for tool in await gateway.list_tools():
+                print(tool)
 
+
+async def _start_competition_run(settings: Settings, case_set: CaseSet) -> None:
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"{settings.competition_api_url}/api/v2/runs",
+                headers={"Authorization": f"Bearer {settings.team_api_key}"},
+                json={"variant_id": case_set.variant_id},
+            )
+            response.raise_for_status()
+            run = response.json()
+    except (httpx.HTTPError, json.JSONDecodeError) as exc:
+        raise RuntimeError("could not create the competition run") from exc
+    if (
+        run.get("variant_id") != case_set.variant_id
+        or run.get("case_set_version") != case_set.version
+    ):
+        raise RuntimeError("competition run does not match the local case-set")
+    print(
+        f"RUN: {run['variant_id']} / {run['case_set_version']} / "
+        f"expires {run.get('expires_at', 'unknown')}",
+        flush=True,
+    )
 
 async def _run_session_chunk(
     settings: Settings,
@@ -63,12 +91,13 @@ async def _run_session_chunk(
             contracts.validate_output(output, f"outputs/{case_id}.json")
             if output.get("case_id") != case_id:
                 raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+            if not output.get("evidence_refs"):
+                raise RuntimeError(f"solver returned no auditable evidence for {case_id}")
             target = output_root / f"{case_id}.json"
             temporary = target.with_suffix(".json.tmp")
             temporary.write_text(
                 json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
             )
-            temporary.replace(target)
             trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
             progress[0] += 1
 
@@ -124,7 +153,11 @@ def parser() -> argparse.ArgumentParser:
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("validate-inputs", help="validate case-set.json and all 100 inputs")
     commands.add_parser("mcp-tools", help="authenticate and list discovered MCP tools")
-    commands.add_parser("run", help="run the implemented workflow for all cases")
+    run = commands.add_parser("run", help="run the implemented workflow for all cases")
+    run.add_argument(
+        "--resume", action="store_true",
+        help="skip contract-valid cases that already have a case_finalized trace event",
+    )
     commands.add_parser("validate", help="validate outputs and observable trace")
     package = commands.add_parser("package", help="validate and build the submission ZIP")
     package.add_argument("--output", default="dist/submission.zip")
@@ -142,9 +175,9 @@ def main() -> None:
                 f"{len(case_set.case_ids)} cases"
             )
         elif args.command == "mcp-tools":
-            asyncio.run(_show_tools(root))
+            asyncio.run(_show_tools(root, as_json=args.json))
         elif args.command == "run":
-            asyncio.run(_run(root))
+            asyncio.run(_run(root, resume=args.resume))
         elif args.command == "validate":
             case_set = load_case_set(root)
             contracts = Contracts(root / "contracts" / "schemas")

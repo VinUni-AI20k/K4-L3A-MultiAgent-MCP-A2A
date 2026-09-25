@@ -167,7 +167,8 @@ tool business error vì lỗi đó không mất khi gọi lại.
 | Source conflict | Không retry network | Ghi `data_conflicts`; verifier phải xác nhận invariant | `verification_completed` khi pass |
 | Output/invariant sai | Không | Không ghi output, không finalize | Không `verification_completed`, không `case_finalized` |
 
-## 6. Verification invariants
+- `qwen/qwen3-8b`;
+- `qwen/qwen3-8b:free`.
 
 Trước `case_finalized`, Verifier bắt buộc kiểm tra:
 

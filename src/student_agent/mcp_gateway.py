@@ -8,6 +8,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppres
 from typing import Any
 
 import httpx2
+from jsonschema import Draft202012Validator
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
@@ -61,6 +62,13 @@ def _is_connection_closed(error: BaseException) -> bool:
     if isinstance(error, BaseExceptionGroup):
         return any(_is_connection_closed(child) for child in error.exceptions)
     return False
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str
+    description: str
+    input_schema: dict[str, Any]
 
 
 class EvidenceGateway:
@@ -127,6 +135,11 @@ class EvidenceGateway:
         raise AssertionError("MCP tool discovery retry loop exited unexpectedly")
 
     async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+        if self._tools is None:
+            raise RuntimeError("MCP tools must be discovered before calling a tool")
+        spec = self._tools.get(tool_name)
+        if spec is None:
+            raise ValueError(f"MCP tool was not discovered: {tool_name}")
         payload = {"case_id": case_id, **arguments}
         async with self._request_lock:
             for attempt in range(1, self.max_attempts + 1):
@@ -216,7 +229,25 @@ class EvidenceGateway:
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
-            raise RuntimeError(f"MCP tool {tool_name} failed: {message or 'unknown error'}")
+
+        result = None
+        for attempt in range(3):
+            try:
+                result = await self._session.call_tool(tool_name, arguments=payload)
+                is_error = bool(
+                    getattr(result, "is_error", getattr(result, "isError", False))
+                )
+                if is_error:
+                    message = " ".join(
+                        block.text for block in result.content if getattr(block, "text", None)
+                    )
+                    raise RuntimeError(f"MCP tool {tool_name} failed: {message or 'unknown error'}")
+                break
+            except Exception as exc:
+                if attempt == 2 or not _retryable(exc):
+                    raise
+                await asyncio.sleep(0.25 * (2**attempt))
+        assert result is not None
         evidence = getattr(result, "structuredContent", None)
         if evidence is None:
             evidence = getattr(result, "structured_content", None)
@@ -234,6 +265,14 @@ class EvidenceGateway:
         if evidence["result_hash"] != f"sha256:{digest}":
             raise ContractError(f"{label}: result_hash does not match canonical data")
         return evidence
+
+
+def _retryable(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in ("timeout", "temporary", "unavailable", "connection", "reset", "rate limit")
+    )
 
 
 @asynccontextmanager

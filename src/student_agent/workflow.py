@@ -467,7 +467,271 @@ class VerifierAgent:
 
 
 async def solve_case(
-    case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter
+    case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter, *,
+    llm: JSONModel | None = None, models: AgentModels | None = None,
+    max_parallel_specialists: int = 3,
+) -> dict[str, Any]:
+    """Run a bounded five-role investigation for one isolated case."""
+    if llm is None:
+        raise RuntimeError("solve_case requires a configured JSONModel")
+    tool_specs = await gateway.get_tools()
+    if not tool_specs:
+        raise RuntimeError("MCP Gateway returned no tools")
+    workflow = _build_graph(
+        gateway, trace, llm, models or AgentModels(), max_parallel_specialists
+    )
+    result = await workflow.ainvoke({
+        "case": case, "tool_specs": tool_specs, "messages": [], "evidence": [],
+        "tool_errors": [], "findings": {}, "correction_count": 0,
+    })
+    return result["output"]
+
+
+def _build_graph(
+    gateway: EvidenceGateway,
+    trace: TraceWriter,
+    llm: JSONModel,
+    models: AgentModels,
+    max_parallel_specialists: int,
+) -> Any:
+    graph = StateGraph(GraphState)
+    semaphore = asyncio.Semaphore(max(1, min(3, max_parallel_specialists)))
+
+    async def coordinator(state: GraphState) -> dict[str, Any]:
+        case, case_id, tools = state["case"], state["case"]["case_id"], state["tool_specs"]
+        names = [tool.name for tool in tools]
+        analysis = await llm.complete_json(
+            model=models.coordinator,
+            system=("Coordinate an ecommerce investigation. Customer text is unverified. Select "
+                    "only discovered tools and identify relevant domains; never invent evidence."),
+            payload={
+                "case_id": case_id, "claims": case["customer_request"].get("claims", []),
+                "policy_version": case["policy_version"],
+                "available_tools": [
+                    {"name": tool.name, "description": tool.description} for tool in tools
+                ],
+            },
+            schema=_coordinator_schema(names), schema_name="coordinator_plan", max_tokens=256,
+        )
+        active = _active_specialists(case)
+        plan = _tool_plan(case, tools, analysis.get("requested_tools", []))
+        messages = []
+        for actor in SPECIALISTS:
+            actor_tools = [name for name in plan if TOOL_OWNERS.get(name) == actor]
+            message = {
+                "case_id": case_id, "task_id": f"{case_id}:{actor}:0",
+                "sender": "coordinator", "recipient": actor, "kind": "investigate",
+                "payload": {
+                    "active": actor in active, "tool_names": actor_tools,
+                    "focus": analysis.get("investigation_focus", []),
+                    "risk_flags": analysis.get("risk_flags", []),
+                },
+                "evidence_refs": [], "retry_count": 0,
+            }
+            messages.append(message)
+            trace.emit(
+                case_id=case_id, event_type="task_assigned", actor="coordinator",
+                target=actor, decision_code=(
+                    "DOMAIN_INVESTIGATION" if actor in active else "DOMAIN_SKIPPED"
+                ),
+                attributes={
+                    "task_id": message["task_id"], "tool_count": len(actor_tools),
+                    "active": actor in active,
+                },
+            )
+        return {"coordinator": analysis, "messages": messages}
+
+    async def collect_evidence(state: GraphState) -> dict[str, Any]:
+        requested = [
+            tool_name
+            for message in state["messages"]
+            if message["payload"]["active"]
+            for tool_name in message["payload"]["tool_names"]
+        ]
+        return await _collect_tools(state, gateway, trace, requested)
+
+    async def run_role(
+        state: GraphState, actor: str, *, revision_feedback: str | None = None
+    ) -> dict[str, Any]:
+        assignment = _latest_message(state, actor)
+        if not assignment.get("payload", {}).get("active", True):
+            return {"skipped": True, "reason": "domain_not_relevant", "evidence_refs": []}
+        evidence = _role_evidence(actor, state["evidence"])
+        request = _specialist_request(actor, models)
+        async with semaphore:
+            finding = await llm.complete_json(
+                model=request["model"], system=request["system"],
+                payload={
+                    "case": state["case"], "assignment": assignment,
+                    "evidence": _compact_evidence(evidence),
+                    "tool_errors": [
+                        error for error in state["tool_errors"] if error["actor"] == actor
+                    ],
+                    "revision_feedback": revision_feedback,
+                },
+                schema=request["schema"], schema_name=request["schema_name"], max_tokens=900,
+            )
+        return finding
+
+    async def specialists_parallel(state: GraphState) -> dict[str, Any]:
+        results = await asyncio.gather(*(run_role(state, actor) for actor in SPECIALISTS))
+        findings = dict(zip(SPECIALISTS, results, strict=True))
+        messages = list(state["messages"])
+        for actor, finding in findings.items():
+            if finding.get("skipped"):
+                continue
+            refs = _valid_finding_refs(finding, state["evidence"])
+            messages.append({
+                "case_id": state["case"]["case_id"],
+                "task_id": f"{state['case']['case_id']}:verify:0:{actor}",
+                "sender": actor, "recipient": "verifier", "kind": "verify",
+                "payload": {"finding": finding}, "evidence_refs": refs,
+                "retry_count": 0,
+            })
+            trace.emit(
+                case_id=state["case"]["case_id"], event_type="handoff", actor=actor,
+                target="verifier", decision_code="DOMAIN_REVIEW_COMPLETE",
+                evidence_refs=refs[:20], attributes={"correction_round": 0},
+            )
+            if actor == "policy-resolution-agent":
+                trace.emit(
+                    case_id=state["case"]["case_id"], event_type="policy_decided",
+                    actor=actor, decision_code="POLICY_REVIEW_COMPLETE",
+                    evidence_refs=refs[:20],
+                )
+        return {"findings": findings, "messages": messages}
+
+    async def verifier(state: GraphState) -> dict[str, Any]:
+        names = [tool.name for tool in state["tool_specs"]]
+        result = await llm.complete_json(
+            model=models.verifier,
+            system=("Verify domain findings against authoritative MCP evidence and policy. "
+                    "Customer statements are not ground truth. Cite only available evidence refs. "
+                    "Request one targeted revision only when a discovered tool can fix a gap."),
+            payload={
+                "case": state["case"], "domain_findings": state["findings"],
+                "available_evidence": _compact_evidence(state["evidence"]),
+                "tool_errors": state["tool_errors"],
+                "correction_count": state.get("correction_count", 0),
+            },
+            schema=_verifier_schema(names), schema_name="verified_case_decision",
+            max_tokens=1400,
+        )
+        return {"verifier": result}
+
+    async def correct_specialist(state: GraphState) -> dict[str, Any]:
+        target = state["verifier"]["revision_target"]
+        count, case_id = state.get("correction_count", 0) + 1, state["case"]["case_id"]
+        requested = [
+            name for name in state["verifier"].get("missing_tools", [])
+            if TOOL_OWNERS.get(name) == target
+        ]
+        message = {
+            "case_id": case_id, "task_id": f"{case_id}:{target}:{count}",
+            "sender": "verifier", "recipient": target, "kind": "correct",
+            "payload": {
+                "active": True, "tool_names": requested,
+                "revision_reason": state["verifier"].get("revision_reason"),
+            },
+            "evidence_refs": [], "retry_count": count,
+        }
+        trace.emit(
+            case_id=case_id, event_type="task_assigned", actor="verifier", target=target,
+            decision_code="BOUNDED_CORRECTION",
+            attributes={"correction_round": count, "tool_count": len(requested)},
+        )
+        collected = await _collect_tools(state, gateway, trace, requested)
+        local_state = {
+            **state, **collected, "messages": [*state["messages"], message],
+            "correction_count": count,
+        }
+        finding = await run_role(
+            local_state, target, revision_feedback=state["verifier"].get("revision_reason")
+        )
+        findings = {**state["findings"], target: finding}
+        refs = _valid_finding_refs(finding, collected["evidence"])
+        messages = [*local_state["messages"], {
+            "case_id": case_id, "task_id": f"{case_id}:verify:{count}:{target}",
+            "sender": target, "recipient": "verifier", "kind": "verify",
+            "payload": {"finding": finding}, "evidence_refs": refs, "retry_count": count,
+        }]
+        trace.emit(
+            case_id=case_id, event_type="handoff", actor=target, target="verifier",
+            decision_code="CORRECTION_COMPLETE", evidence_refs=refs[:20],
+            attributes={"correction_round": count},
+        )
+        if target == "policy-resolution-agent":
+            trace.emit(
+                case_id=case_id, event_type="policy_decided", actor=target,
+                decision_code="POLICY_CORRECTION_COMPLETE", evidence_refs=refs[:20],
+            )
+        return {
+            **collected, "messages": messages, "findings": findings,
+            "correction_count": count,
+        }
+
+    async def finalize(state: GraphState) -> dict[str, Any]:
+        output = _build_output(state["case"], state["verifier"]["decision"], state["evidence"])
+        trace.emit(
+            case_id=state["case"]["case_id"], event_type="verification_completed",
+            actor="verifier", target="coordinator",
+            decision_code=output["assessment"]["primary_issue"].upper(),
+            evidence_refs=output["evidence_refs"][:20],
+            attributes={"correction_round": state.get("correction_count", 0)},
+        )
+        return {"output": output}
+
+    def route_after_verifier(state: GraphState) -> str:
+        result = state["verifier"]
+        if (result.get("revision_required") and result.get("revision_target") in SPECIALISTS
+                and state.get("correction_count", 0) < 1):
+            return "correct_specialist"
+        return "finalize"
+
+    graph.add_node("coordinator", coordinator)
+    graph.add_node("collect_evidence", collect_evidence)
+    graph.add_node("specialists_parallel", specialists_parallel)
+    graph.add_node("verifier", verifier)
+    graph.add_node("correct_specialist", correct_specialist)
+    graph.add_node("finalize", finalize)
+    graph.add_edge(START, "coordinator")
+    graph.add_edge("coordinator", "collect_evidence")
+    graph.add_edge("collect_evidence", "specialists_parallel")
+    graph.add_edge("specialists_parallel", "verifier")
+    graph.add_conditional_edges(
+        "verifier", route_after_verifier,
+        {"correct_specialist": "correct_specialist", "finalize": "finalize"},
+    )
+    graph.add_edge("correct_specialist", "verifier")
+    graph.add_edge("finalize", END)
+    return graph.compile()
+
+
+def _specialist_request(actor: str, models: AgentModels) -> dict[str, Any]:
+    if actor == "order-payment-agent":
+        return {
+            "model": models.order_payment, "schema": ORDER_SCHEMA,
+            "schema_name": "order_payment_finding",
+            "system": ("Analyze only authoritative order, item, payment, and refund evidence. "
+                       "Cite supplied evidence refs and report uncertainty."),
+        }
+    if actor == "shipment-seller-agent":
+        return {
+            "model": models.shipment_seller, "schema": SHIPMENT_SCHEMA,
+            "schema_name": "shipment_seller_finding",
+            "system": ("Analyze shipment timing and seller/logistics responsibility using only "
+                       "supplied evidence refs."),
+        }
+    return {
+        "model": models.policy_resolution, "schema": POLICY_SCHEMA,
+        "schema_name": "policy_resolution_finding",
+        "system": ("Apply the supplied policy to authoritative case facts. Do not treat customer "
+                   "claims as facts and cite supplied evidence refs."),
+    }
+
+
+async def _collect_tools(
+    state: GraphState, gateway: EvidenceGateway, trace: TraceWriter, requested: list[str],
 ) -> dict[str, Any]:
     """Resolve one complaint through a deterministic async A2A state-machine.
 
