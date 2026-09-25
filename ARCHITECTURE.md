@@ -77,7 +77,12 @@ Model chỉ nhận facts tối thiểu đã loại bỏ message, ID, evidence re
 tra issue. Model không được tạo hoặc sửa evidence refs, số tiền hay action. Candidate
 cuối vẫn bị kiểm tra bằng invariant xác định.
 
-## 5. Model policy
+| Failure | Retry? | Fallback | Trace event/code |
+| --- | --- | --- | --- |
+| MCP timeout/connection tạm thời | Tối đa 2 retry, exponential backoff | Dừng case nếu vẫn lỗi | Lỗi runtime, không tạo evidence |
+| Not found/permanent tool error | Không | Dừng hoặc kết luận thiếu evidence nếu gateway trả envelope hợp lệ | Không tạo ref giả |
+| Source conflict | Không | Verifier chọn nguồn hoặc để unresolved | `verification_completed`; conflict vào output |
+| Invalid agent result | 1 structured repair | Dừng case nếu vẫn sai | Không ghi nội dung sai vào trace |
 
 Model mặc định là `qwen/qwen3-8b` qua OpenRouter. Model có 8,2B tham số và đáp ứng
 yêu cầu dưới 10B. Allowlist trong `model_client.py` chỉ cho phép:
@@ -97,47 +102,30 @@ output. Nếu model lỗi hoặc trả JSON sai, deterministic candidate vẫn �
 confidence bị hạ và trace ghi `MODEL_UNAVAILABLE`. Nếu model bất đồng, trace ghi
 `MODEL_DISAGREED` và confidence cũng bị giới hạn.
 
-## 6. Failure policy
+Mặc định dùng Ollama OpenAI-compatible tại `http://127.0.0.1:11434/v1`, temperature
+0 và structured JSON output. Model assignment:
 
-| Failure | Retry? | Fallback | Trace/behavior |
-| --- | --- | --- | --- |
-| MCP timeout/tool error | Không retry tự động trong bản hiện tại | Dừng run để không tạo output thiếu provenance | CLI báo lỗi, không finalize case |
-| Entity không tồn tại | Không | Dừng hoặc `insufficient_evidence` nếu response hợp lệ nhưng không hỗ trợ claim | Không tạo dữ liệu giả |
-| Source conflict | Không tự chọn bằng tổng/cộng cơ học | Ưu tiên lifecycle event và policy | Candidate dựa trên nguồn có thẩm quyền |
-| Model timeout/HTTP/JSON lỗi | Không | Giữ candidate đã kiểm chứng, hạ confidence | `MODEL_UNAVAILABLE` |
-| Model bất đồng | Không | Giữ rule/evidence decision, hạ confidence | `MODEL_DISAGREED` |
-| Invalid final output | Không | Từ chối ghi file | `VERIFICATION_FAILED` hoặc contract error |
+| Actor | Model | Budget |
+| --- | --- | ---: |
+| Coordinator | `qwen3:1.7b` | 1.7B |
+| Order/Payment | `qwen3:1.7b` | 1.7B |
+| Shipment/Seller | `qwen3:1.7b` | 1.7B |
+| Policy/Resolution | `qwen3:1.7b` | 1.7B |
+| Verifier | `qwen3:1.7b` | 1.7B |
+| **Tổng theo vai trò** | | **8.5B** |
 
-Không chuyển missing evidence thành dữ liệu phỏng đoán.
+Concurrency giữa case là 1; concurrency specialist tối đa 3. Ollama dùng context 4096 và
+cần được khởi động với `OLLAMA_NUM_PARALLEL=3` để thực thi request song song thực sự.
+Model name, endpoint và timeout được cấu hình bằng `.env`.
+Không ghi API key trong architecture, output hoặc trace. Kiểm tra bằng `pytest -q`,
+`day09 validate-inputs`, `day09 run` (hoặc `--resume`), `day09 validate` và
+`day09 package`. Mỗi case ghi trace vào file tạm; chỉ sau khi output validate thành công
+mới append nguyên tử theo case vào `trace.jsonl`.
 
-## 7. Verification invariants
+## 8. Repository directories
 
-Trước khi finalize, workflow kiểm tra:
-
-- output `case_id` trùng input;
-- evidence refs là danh sách duy nhất;
-- action không trùng;
-- tổng refund lines bằng `recommended_refund_brl` sau khi chuẩn hóa hai chữ số;
-- issue phải thuộc public enum;
-- model phải thuộc allowlist dưới 10B;
-- model confidence phải là số trong `[0, 1]`;
-- model không có quyền thay đổi candidate;
-- policy chỉ được dùng sau khi domain evidence xác nhận issue.
-
-Sau đó `Contracts.validate_output` kiểm tra toàn bộ JSON Schema, enum, pattern, giới
-hạn số phần tử và additional properties.
-
-## 8. Reproducibility
-
-- Python: từ 3.11; CI dùng 3.11.
-- Dependency: khai báo và giới hạn version trong `pyproject.toml`.
-- Model: `qwen/qwen3-8b`, temperature 0, max tokens 500.
-- Concurrency: tuần tự, một case tại một thời điểm.
-- Random seed: không sử dụng; trace event ID dùng random an toàn và không ảnh hưởng output.
-- Input order: theo `case-set.json`.
-- Chạy: `python -m student_agent.cli run`.
-- Tiếp tục batch gián đoạn: `python -m student_agent.cli run --resume`.
-- Validate: `python -m student_agent.cli validate`.
-- Đóng gói: `python -m student_agent.cli package --output dist/submission.zip`.
-
-Không ghi API key vào source, trace, output hoặc tài liệu.
+- `contracts/`: nguồn chuẩn chỉ đọc cho schema, registry và scoring policy.
+- `inputs/`: payload case; customer message là claim, không phải ground truth.
+- `outputs/`: một output JSON đã validate cho mỗi case.
+- `tests/`: unit/graph/contract tests với fake MCP và fake model.
+- `traces/`: observable JSONL lifecycle, không chứa dữ liệu suy luận riêng.
