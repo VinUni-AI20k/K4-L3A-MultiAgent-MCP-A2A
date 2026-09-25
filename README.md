@@ -142,7 +142,8 @@ Gợi ý có thể tổ chức các vai trò:
 
 Competition không chấm tên framework hay số lượng class. Scorer đánh giá kết quả, evidence và sự phối hợp thể hiện trong trace.
 
-Hoàn thiện mô tả thiết kế trong `ARCHITECTURE.md`.
+Hoàn thiện mô tả thiết kế trong `ARCHITECTURE.md`, gồm DAG A2A, tool
+permissions, evidence provenance, retry và verification invariants.
 
 ## 6. Chạy và kiểm tra
 
