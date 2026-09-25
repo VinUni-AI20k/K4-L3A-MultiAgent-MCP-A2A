@@ -1,4 +1,11 @@
-# L3A Architecture Record
+# L3A Architecture Record — Team Violet
+
+## 0. Thông tin nhóm (Team Information)
+- **Tên nhóm:** Violet
+- **Thành viên:**
+  1. Nguyễn Phát Thịnh (2A202602645) — Team Lead / Architecture / Coordinator & Verifier
+  2. Lê Nguyễn Thái Dương (2A202602383) — Specialist: Order, Item & Shipment
+  3. Nguyễn Minh Lương (2A202602618) — Specialist: Payment, Policy & Financial Resolution
 
 Team phải cập nhật tài liệu này cùng source. Mục tiêu là mô tả quyết định có thể kiểm chứng, không ghi prompt bí mật hoặc chain-of-thought.
 
@@ -14,16 +21,14 @@ Input → Coordinator → Specialists → Verifier → Output
 
 ## 2. Agent ownership
 
-| Actor | Input | Trách nhiệm | Output/handoff |
-| --- | --- | --- | --- |
-| Coordinator | TODO | TODO | TODO |
-| Order/item | TODO | TODO | TODO |
-| Payment | TODO | TODO | TODO |
-| Shipment | TODO | TODO | TODO |
-| Policy | TODO | TODO | TODO |
-| Verifier | TODO | TODO | TODO |
-
-Nêu rõ actor nào được quyền gọi tool nào. Tránh cho mọi agent quyền truy vấn tất cả tool nếu không cần thiết.
+| Actor | Người phụ trách | Input | Trách nhiệm | Quyền gọi Tool MCP | Output / Handoff |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Coordinator** | Nguyễn Phát Thịnh | Case input JSON (`customer_message`, `claims`) | Tiếp nhận case, phân tích sơ bộ, chia task cho các Specialist | Không gọi trực tiếp tool dữ liệu (chỉ discovery tools) | Handoff task tới Order, Shipment, Payment |
+| **Order/Item** | Lê Nguyễn Thái Dương | `order_id`, `item_id` từ Coordinator | Kiểm tra trạng thái đơn hàng, thông tin sản phẩm, danh tính seller | `get_order`, `get_order_items`, `get_seller` | Kết quả đơn hàng, `order_ids`, `item_ids`, `seller_ids`, `evidence_refs` |
+| **Shipment** | Lê Nguyễn Thái Dương | `order_id`, ngày mua hàng, thông tin giao hàng | Kiểm tra hành trình đơn, đối chiếu ngày giao hàng dự kiến vs thực tế, xác định lỗi trễ do seller hay logistics | `get_shipment`, `get_carrier_status` | Trạng thái vận chuyển, `shipment_ids`, xác định lỗi `late_delivery_*`, `evidence_refs` |
+| **Payment** | Nguyễn Minh Lương | `order_id`, số tiền khách khiếu nại | Kiểm tra giao dịch, các phương thức thanh toán, phát hiện trùng lặp (`duplicate_charge`), lệch tiền, trạng thái hoàn tiền | `get_payment`, `get_refund_status` | Trạng thái thanh toán, `payment_references`, bằng chứng thanh toán |
+| **Policy** | Nguyễn Minh Lương | Dữ liệu từ Order, Payment, Shipment & các claims | Tra cứu chính sách sàn, xác định tính hợp lệ của khiếu nại, tính toán số tiền hoàn (`BRL`), đề xuất actions | `get_policy`, `get_refund_rules` | `claim_assessments`, `financial_resolution`, `resolution_actions` |
+| **Verifier** | Nguyễn Phát Thịnh | Toàn bộ kết quả từ các Specialist | Kiểm tra chéo (consistency), ràng buộc schema, tính `confidence`, phát hiện xung đột dữ liệu | Không gọi tool (chỉ thẩm định kết quả) | Output JSON hoàn chỉnh hợp lệ, emit `verification_completed` |
 
 ## 3. A2A protocol
 

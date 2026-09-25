@@ -9,7 +9,7 @@ from pathlib import Path
 from .cases import load_case_set
 from .config import Settings
 from .contracts import Contracts
-from .mcp_gateway import connect_gateway
+from .mcp_gateway import connect_gateway, is_retryable_error
 from .submission import package_submission, validate_artifacts
 from .trace import TraceWriter
 from .workflow import solve_case
@@ -27,6 +27,47 @@ async def _show_tools(root: Path) -> None:
             print(tool)
 
 
+async def _discover_tools(
+    settings: Settings, contracts: Contracts, attempts: int = 3
+) -> list[str]:
+    """Discover tools with a fresh, retryable MCP transport."""
+    for attempt in range(attempts):
+        try:
+            async with connect_gateway(
+                settings.mcp_endpoint, settings.team_api_key, contracts
+            ) as gateway:
+                return await gateway.list_tools()
+        except Exception as error:
+            if attempt == attempts - 1 or not is_retryable_error(error):
+                raise RuntimeError("MCP tool discovery failed") from error
+            await asyncio.sleep(0.5 * (2**attempt))
+    raise RuntimeError("MCP tool discovery failed")
+
+
+async def _solve_with_fresh_gateway(
+    case: dict[str, object],
+    settings: Settings,
+    contracts: Contracts,
+    trace: TraceWriter,
+    attempts: int = 3,
+) -> dict[str, object]:
+    """Solve one case in an isolated session so a stale stream cannot kill the batch."""
+    case_id = str(case["case_id"])
+    for attempt in range(attempts):
+        try:
+            async with connect_gateway(
+                settings.mcp_endpoint, settings.team_api_key, contracts
+            ) as gateway:
+                return await solve_case(case, gateway, trace)
+        except Exception as error:
+            if attempt == attempts - 1 or not is_retryable_error(error):
+                raise RuntimeError(
+                    f"MCP session failed for {case_id} after {attempt + 1} attempt(s)"
+                ) from error
+            await asyncio.sleep(0.5 * (2**attempt))
+    raise RuntimeError(f"MCP session failed for {case_id}")
+
+
 async def _run(root: Path) -> None:
     settings = Settings.load(root)
     case_set = load_case_set(root)
@@ -40,24 +81,25 @@ async def _run(root: Path) -> None:
     trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
 
-    async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        discovered_tools = await gateway.list_tools()
-        if not discovered_tools:
-            raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+    discovered_tools = await _discover_tools(settings, contracts)
+    if not discovered_tools:
+        raise RuntimeError("MCP Gateway returned no tools")
+    total_cases = len(case_set.case_ids)
+    for index, case_id in enumerate(case_set.case_ids, 1):
+        case = case_set.cases[case_id]
+        trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+        output = await _solve_with_fresh_gateway(case, settings, contracts, trace)
+        contracts.validate_output(output, f"outputs/{case_id}.json")
+        if output.get("case_id") != case_id:
+            raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+        target = output_root / f"{case_id}.json"
+        temporary = target.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        temporary.replace(target)
+        trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+        print(f"OK [{index}/{total_cases}] {case_id}", flush=True)
 
 
 def parser() -> argparse.ArgumentParser:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -24,7 +25,8 @@ class EvidenceGateway:
     async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
         result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        is_error = getattr(result, "is_error", getattr(result, "isError", False))
+        if is_error:
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
@@ -39,6 +41,59 @@ class EvidenceGateway:
             evidence = json.loads(text_blocks[0])
         self._contracts.validate_evidence(evidence, f"MCP tool {tool_name}")
         return evidence
+
+
+def is_retryable_error(error: BaseException) -> bool:
+    """Retry transport-like failures, but never retry malformed requests."""
+    if isinstance(error, BaseExceptionGroup):
+        return any(is_retryable_error(child) for child in error.exceptions)
+    if isinstance(error, (ValueError, KeyError, TypeError)):
+        return False
+    if isinstance(error, (TimeoutError, OSError)):
+        return True
+    message = f"{type(error).__name__} {error}".lower()
+    markers = (
+        "connecterror",
+        "readerror",
+        "remoteprotocolerror",
+        "timeout",
+        "timed out",
+        "temporarily unavailable",
+        "connection reset",
+        "connection refused",
+        "502",
+        "503",
+        "504",
+        "rate limit",
+        "too many requests",
+    )
+    return any(marker in message for marker in markers)
+
+
+async def call_with_retry(
+    gateway: EvidenceGateway,
+    tool_name: str,
+    *,
+    case_id: str,
+    attempts: int = 3,
+    backoff_seconds: float = 0.15,
+    **arguments: str,
+) -> dict[str, Any]:
+    """Call an idempotent evidence tool with bounded exponential backoff."""
+    if attempts < 1:
+        raise ValueError("attempts must be positive")
+
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return await gateway.call(tool_name, case_id=case_id, **arguments)
+        except Exception as error:
+            last_error = error
+            if attempt == attempts - 1 or not is_retryable_error(error):
+                raise
+            await asyncio.sleep(backoff_seconds * (2**attempt))
+
+    raise RuntimeError(f"MCP tool {tool_name} failed") from last_error
 
 
 @asynccontextmanager
