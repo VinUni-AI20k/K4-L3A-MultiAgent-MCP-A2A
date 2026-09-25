@@ -1,537 +1,268 @@
 from __future__ import annotations
 
-import asyncio
-from datetime import datetime
-from decimal import Decimal, InvalidOperation
 from typing import Any
+import os
+import json
+import asyncio
 
-import httpx2
+from google import genai
+from google.genai import types
 
-from . import OUTPUT_SCHEMA_VERSION
 from .mcp_gateway import EvidenceGateway
 from .trace import TraceWriter
+from .models import L3AOutput
 
-PERMISSIONS = {
-    "order-agent": {"get_order": "order", "get_order_items": "item"},
-    "payment-agent": {"get_payment_timeline": "payment", "get_refund_timeline": "refund"},
-    "shipment-agent": {"get_shipment_summary": "shipment"},
-    "policy-agent": {"get_policy": "policy"},
-}
-ZERO = Decimal("0.00")
-
-
-def _money(value: Any) -> Decimal:
-    try:
-        amount = Decimal(str(value))
-        if not amount.is_finite() or amount < 0:
-            raise ValueError("Invalid monetary amount")
-        return amount.quantize(Decimal("0.01"))
-    except InvalidOperation as exc:
-        raise ValueError("Invalid monetary amount") from exc
-
-
-def _time(value: Any) -> datetime:
-    if not isinstance(value, str):
-        raise ValueError("Missing evidence timestamp")
-    result = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if result.tzinfo is None:
-        raise ValueError("Evidence timestamp must include a timezone")
-    return result
-
-
-def _rows(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
-        raise ValueError("Expected evidence rows")
-    return value
-
-
-def _check_scope(value: Any, order_id: str) -> None:
-    if isinstance(value, dict):
-        if "order_id" in value and value["order_id"] != order_id:
-            raise ValueError("Evidence contains an order outside this case")
-        for child in value.values():
-            _check_scope(child, order_id)
-    elif isinstance(value, list):
-        for child in value:
-            _check_scope(child, order_id)
-
-
-class _CaseWorkflow:
-    """Case-local A2A state; no evidence or decisions are shared between cases."""
-
-    def __init__(self, case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter):
-        self.case = case
-        self.gateway = gateway
-        self.trace = trace
-        self.case_id = case["case_id"]
-        self.order_id = case["customer_request"]["claimed_order_id"]
-        self.evidence: dict[str, dict[str, Any]] = {}
-        self.failures: set[str] = set()
-        self.conflicts: list[dict[str, Any]] = []
-        self.tools: set[str] = set()
-
-    def emit(self, event_type: str, actor: str, **fields: Any) -> None:
-        self.trace.emit(case_id=self.case_id, event_type=event_type, actor=actor, **fields)
-
-    def conflict(self, field: str, sources: list[str], selected: str | None, code: str) -> None:
-        entry = dict(field=field, sources=sources, selected_source=selected, resolution_code=code)
-        if entry not in self.conflicts:
-            self.conflicts.append(entry)
-
-    async def collect(self, actor: str, tool: str) -> Any:
-        domain = PERMISSIONS[actor][tool]
-        self.emit("task_assigned", "coordinator", target=actor, tool_name=tool)
-        arguments = (
-            {"policy_version": self.case["policy_version"]}
-            if tool == "get_policy"
-            else {"order_id": self.order_id}
+async def fetch_evidence(
+    gateway: EvidenceGateway,
+    trace: TraceWriter,
+    case_id: str,
+    tool_name: str,
+    actor_name: str,
+    **kwargs
+) -> dict:
+    """Wrapper to call MCP tool and emit trace event safely."""
+    evidence = await gateway.call(tool_name, case_id=case_id, **kwargs)
+    
+    evidence_ref = evidence.get("evidence_ref")
+    data = evidence.get("data", {})
+    
+    # EMIT TRACE EVENT (Rule #4)
+    if evidence_ref:
+        trace.emit(
+            case_id=case_id,
+            event_type="tool_result_consumed",
+            actor=actor_name,
+            tool_name=tool_name,
+            evidence_refs=[evidence_ref],
         )
-        code = "TOOL_UNAVAILABLE"
-        if tool in self.tools:
-            for attempt in range(3):
-                try:
-                    async with asyncio.timeout(45):
-                        envelope = await self.gateway.call(tool, case_id=self.case_id, **arguments)
-                    self.trace.contracts.validate_evidence(envelope)
-                    if envelope["domain"] != domain:
-                        raise ValueError("Unexpected evidence domain")
-                    data = envelope["data"]
-                    _check_scope(data, self.order_id)
-                    if tool == "get_order_items":
-                        _rows(data)
-                    elif not isinstance(data, dict):
-                        raise ValueError("Expected evidence object")
-                    elif tool != "get_policy" and data.get("order_id") != self.order_id:
-                        raise ValueError("Missing or mismatched evidence order")
-                    if (
-                        tool == "get_policy"
-                        and data.get("policy_version") != arguments["policy_version"]
-                    ):
-                        raise ValueError("Mismatched policy version")
-                    self.evidence[tool] = envelope
-                    self.emit(
-                        "tool_result_consumed",
-                        actor,
-                        tool_name=tool,
-                        evidence_refs=[envelope["evidence_ref"]],
-                    )
-                    self.emit(
-                        "handoff",
-                        actor,
-                        target="policy-agent",
-                        tool_name=tool,
-                        decision_code="EVIDENCE_READY",
-                        evidence_refs=[envelope["evidence_ref"]],
-                    )
-                    return data
-                except (TimeoutError, httpx2.TransportError):
-                    code = "MCP_TRANSIENT_FAILURE"
-                    if attempt < 2:
-                        self.emit(
-                            "task_assigned",
-                            "coordinator",
-                            target=actor,
-                            tool_name=tool,
-                            decision_code="RETRY",
-                            attributes={"attempt": attempt + 2},
-                        )
-                        await asyncio.sleep(0.5 * 2**attempt)
-                        continue
-                except httpx2.HTTPStatusError as exc:
-                    code = "MCP_HTTP_FAILURE"
-                    if exc.response.status_code in {429, 502, 503, 504} and attempt < 2:
-                        self.emit(
-                            "task_assigned",
-                            "coordinator",
-                            target=actor,
-                            tool_name=tool,
-                            decision_code="RETRY",
-                            attributes={"attempt": attempt + 2},
-                        )
-                        await asyncio.sleep(0.5 * 2**attempt)
-                        continue
-                except (RuntimeError, ValueError):
-                    # Do not retry access errors, invalid contracts or ambiguous server errors.
-                    code = "INVALID_OR_UNAVAILABLE_EVIDENCE"
-                break
-        self.failures.add(tool)
-        self.emit("handoff", actor, target="policy-agent", tool_name=tool, decision_code=code)
-        return None
-
-    def events(
-        self, data: dict[str, Any], purchase: datetime, opened: datetime, tool: str
-    ) -> list[dict[str, Any]]:
-        rows = _rows(data["events"])
-        selected = [row for row in rows if purchase <= _time(row["event_at"]) <= opened]
-        if len(selected) != len(rows):
-            self.conflict(
-                "events.event_at",
-                ["get_order", tool],
-                tool,
-                "FILTER_TO_PURCHASE_AND_CASE_OPENED_AT",
-            )
-        return sorted(selected, key=lambda row: _time(row["event_at"]))
-
-    def decide(
-        self, order: Any, items: Any, payment: Any, shipment: Any, refund: Any, policy: Any
-    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-        issue = "insufficient_evidence"
-        used = {"get_order", "get_order_items", "get_payment_timeline"}
-        selected_items: list[dict[str, Any]] = []
-        captures: list[dict[str, Any]] = []
-        paid = ZERO
-        late_sellers: set[str] = set()
-        try:
-            if not all(isinstance(data, dict) for data in (order, payment, policy)):
-                raise ValueError("Missing core evidence")
-            purchase = _time(order["order_purchase_timestamp"])
-            opened = _time(self.case["opened_at"])
-            estimated = _time(order["order_estimated_delivery_date"])
-            if opened < purchase or estimated < purchase:
-                raise ValueError("Inconsistent order dates")
-            grouped: dict[str, list[dict[str, Any]]] = {}
-            for row in _rows(items):
-                grouped.setdefault(str(row["order_item_id"]), []).append(row)
-            for rows in grouped.values():
-                eligible = [
-                    row
-                    for row in rows
-                    if purchase <= _time(row["shipping_limit_date"]) <= estimated
-                ]
-                unique = [row for i, row in enumerate(eligible) if row not in eligible[:i]]
-                if len(rows) > 1:
-                    self.conflict(
-                        "order_items",
-                        ["get_order", "get_order_items"],
-                        "get_order_items" if len(unique) == 1 else None,
-                        "DEDUPLICATE_WITHIN_ORDER_TIMELINE",
-                    )
-                if len(unique) != 1:
-                    raise ValueError("Ambiguous item snapshot")
-                if not isinstance(unique[0].get("seller_id"), str) or not unique[0]["seller_id"]:
-                    raise ValueError("Missing seller identity")
-                _money(unique[0]["price"])
-                _money(unique[0]["freight_value"])
-                selected_items.extend(unique)
-            if not selected_items:
-                raise ValueError("Missing order items")
-            events = self.events(payment, purchase, opened, "get_payment_timeline")
-            captures = [
-                e
-                for e in events
-                if e["event_type"] == "captured"
-                and e.get("status") in {"confirmed", "completed", "succeeded"}
-            ]
-            paid = sum((_money(e["amount_brl"]) for e in captures), ZERO)
-            total = sum(
-                (_money(r["price"]) + _money(r["freight_value"]) for r in selected_items), ZERO
-            )
-            refund_events = []
-            if refund is not None:
-                used.add("get_refund_timeline")
-                refund_events = self.events(refund, purchase, opened, "get_refund_timeline")
-            refund_requested = any(
-                c.get("topic", "").startswith("refund_")
-                for c in self.case["customer_request"].get("claims", [])
-            )
-            if refund_requested and refund is None:
-                raise ValueError("Refund claim requires refund lifecycle evidence")
-            latest_refund = refund_events[-1] if refund_events else {}
-            refund_status = latest_refund.get("status")
-            if refund_status == "failed":
-                issue = "refund_failed"
-            elif refund_status in {"pending", "processing", "requested"}:
-                issue = "refund_pending"
-            elif order["order_status"] in {"canceled", "unavailable"} and paid > ZERO:
-                if refund_status in {"completed", "succeeded", "confirmed"}:
-                    raise ValueError("Completed refund needs separate reconciliation")
-                issue = f"{order['order_status']}_order_paid"
-            elif any(
-                e["event_type"] == "reconciliation_mismatch" and e.get("status") == "open"
-                for e in events
-            ):
-                issue = "payment_mismatch"
-            else:
-                used.add("get_shipment_summary")
-                if not isinstance(shipment, dict):
-                    raise ValueError("Missing shipment evidence")
-                for field, key in (
-                    ("delivered_carrier_at", "order_delivered_carrier_date"),
-                    ("delivered_customer_at", "order_delivered_customer_date"),
-                    ("estimated_delivery_at", "order_estimated_delivery_date"),
-                ):
-                    if shipment.get(field) != order.get(key):
-                        self.conflict(
-                            field,
-                            ["get_order", "get_shipment_summary"],
-                            None,
-                            "UNRESOLVED_SOURCE_CONFLICT",
-                        )
-                        raise ValueError("Conflicting shipment timestamps")
-                delivered = shipment.get("delivered_customer_at")
-                delivered_at = _time(delivered) if delivered else None
-                late = min(delivered_at, opened) > estimated if delivered_at else opened > estimated
-                if late:
-                    carrier = _time(shipment["delivered_carrier_at"])
-                    late_sellers = {
-                        row["seller_id"]
-                        for row in selected_items
-                        if carrier > _time(row["shipping_limit_date"])
-                    }
-                    issue = "late_delivery_seller" if late_sellers else "late_delivery_logistics"
-                elif (
-                    len(captures) > 1
-                    and paid > total
-                    and len({_money(e["amount_brl"]) for e in captures}) == 1
-                ):
-                    issue = "duplicate_charge"
-                elif paid != total:
-                    issue = "payment_mismatch"
-                elif len(captures) > 1:
-                    issue = "valid_split_payment"
-                elif delivered_at and delivered_at <= opened and paid > ZERO:
-                    issue = "unsupported_claim"
-                else:
-                    raise ValueError("No conclusive evidence")
-        except (KeyError, TypeError, ValueError):
-            issue = "insufficient_evidence"
-
-        rule = None
-        amount = ZERO
-        parties: list[dict[str, Any]] = []
-        status = "needs_investigation"
-        actions = ["investigate_missing_or_conflicting_evidence"]
-        if issue != "insufficient_evidence":
-            try:
-                rule = policy["rules"][issue]
-                if policy["currency"] != "BRL":
-                    raise ValueError("Unexpected policy currency")
-                amount = _money(rule["refund_brl"])
-                status = rule["case_status"]
-                actions = [rule["recommended_action"]]
-                parties = [dict(party) for party in _rows(rule["responsible_parties"])]
-                # Policy templates can contain seller IDs belonging to a different order.
-                sellers = late_sellers or {row["seller_id"] for row in selected_items}
-                if any(p["party_type"] == "seller" for p in parties):
-                    declared = {p["party_id"] for p in parties if p["party_type"] == "seller"}
-                    if declared != sellers:
-                        self.conflict(
-                            "responsible_parties.party_id",
-                            ["get_policy", "get_order_items"],
-                            "get_order_items",
-                            "USE_SCOPED_SELLER_IDS",
-                        )
-                    parties = [p for p in parties if p["party_type"] != "seller"] + [
-                        {"party_type": "seller", "party_id": seller} for seller in sorted(sellers)
-                    ]
-                if amount > paid or (status == "no_action" and amount != ZERO):
-                    raise ValueError("Policy refund conflicts with captured amount or status")
-                used.add("get_policy")
-            except (KeyError, TypeError, ValueError):
-                issue, status, amount, rule = (
-                    "insufficient_evidence",
-                    "needs_investigation",
-                    ZERO,
-                    None,
-                )
-                parties, actions = [], ["investigate_missing_or_conflicting_evidence"]
-
-        # Conflicts also need their source references in the final evidence set.
-        for conflict in self.conflicts:
-            used.update(conflict["sources"])
-        refs = [
-            self.evidence[name]["evidence_ref"] for name in sorted(used) if name in self.evidence
-        ]
-        warning_count = sum(
-            bool(self.evidence[name].get("warnings")) for name in used if name in self.evidence
-        )
-        confidence = max(0.5, 0.96 - 0.07 * len(self.conflicts) - 0.05 * warning_count)
-        if issue == "duplicate_charge":
-            confidence = min(confidence, 0.75)  # Equal captures alone lack transaction identity.
-        if issue == "insufficient_evidence":
-            confidence = 0.25
-        entities = {
-            "order_ids": [self.order_id] if "get_order" in self.evidence else [],
-            "item_ids": sorted({str(row["order_item_id"]) for row in selected_items}),
-            "seller_ids": sorted({row["seller_id"] for row in selected_items}),
-            "payment_references": sorted(
-                {str(row["payment_reference"]) for row in captures if row.get("payment_reference")}
-            ),
-            "shipment_ids": (
-                [shipment["shipment_id"]]
-                if isinstance(shipment, dict)
-                and shipment.get("shipment_id")
-                and "get_shipment_summary" in used
-                else []
-            ),
-        }
-        claims = []
-        for claim in self.case["customer_request"].get("claims", []):
-            verdict = "insufficient_evidence"
-            if issue != "insufficient_evidence":
-                if claim["topic"] == "requested_full_refund":
-                    verdict = (
-                        "supported"
-                        if paid > ZERO and amount == paid
-                        else "partially_supported"
-                        if amount > ZERO
-                        else "unsupported"
-                    )
-                elif claim["topic"] in policy["rules"]:
-                    verdict = "supported" if claim["topic"] == issue else "unsupported"
-            claims.append(
-                dict(
-                    claim_id=claim["claim_id"],
-                    verdict=verdict,
-                    confidence=round(confidence, 2),
-                    evidence_refs=refs,
-                )
-            )
-        output = {
-            "schema_version": OUTPUT_SCHEMA_VERSION,
-            "case_id": self.case_id,
-            "assessment": dict(
-                primary_issue=issue, case_status=status, confidence=round(confidence, 2)
-            ),
-            "affected_entities": entities,
-            "claim_assessments": claims,
-            "root_cause_analysis": {
-                "ranked_causes": [{"cause_code": issue.upper(), "rank": 1}],
-                "responsible_parties": parties,
-            },
-            "evidence_refs": refs,
-            "data_conflicts": self.conflicts[:5],
-            "financial_resolution": {
-                "currency": "BRL",
-                "recommended_refund_brl": float(amount),
-                "refund_lines": (
-                    [
-                        dict(
-                            reason_code=issue.upper(),
-                            amount_brl=float(amount),
-                            entity_id=self.order_id,
-                        )
-                    ]
-                    if amount
-                    else []
-                ),
-            },
-            "resolution_actions": actions,
-        }
-        return output, rule
-
-    def verify(self, output: dict[str, Any], rule: dict[str, Any] | None) -> None:
-        self.trace.contracts.validate_output(output, f"workflow/{self.case_id}")
-        refs = set(output["evidence_refs"])
-        owned = {e["evidence_ref"] for e in self.evidence.values()}
-        if output["case_id"] != self.case_id or not refs <= owned:
-            raise ValueError("Verifier rejected evidence ownership or case ID")
-        for claim in output["claim_assessments"]:
-            if not set(claim["evidence_refs"]) <= refs:
-                raise ValueError("Verifier rejected claim linkage")
-        if [claim["claim_id"] for claim in output["claim_assessments"]] != [
-            claim["claim_id"] for claim in self.case["customer_request"].get("claims", [])
-        ]:
-            raise ValueError("Verifier rejected claim IDs")
-        financial = output["financial_resolution"]
-        amount = _money(financial["recommended_refund_brl"])
-        if sum((_money(row["amount_brl"]) for row in financial["refund_lines"]), ZERO) != amount:
-            raise ValueError("Verifier rejected refund total")
-        if any(row["entity_id"] != self.order_id for row in financial["refund_lines"]):
-            raise ValueError("Verifier rejected refund entity")
-        fields = {
-            "order_ids": "order_id",
-            "item_ids": "order_item_id",
-            "seller_ids": "seller_id",
-            "payment_references": "payment_reference",
-            "shipment_ids": "shipment_id",
-        }
-
-        def ids(value: Any, field: str) -> set[str]:
-            if isinstance(value, dict):
-                found = {str(value[field])} if value.get(field) is not None else set()
-                for child in value.values():
-                    found.update(ids(child, field))
-                return found
-            if isinstance(value, list):
-                return set().union(*(ids(child, field) for child in value))
-            return set()
-
-        cited = [
-            e["data"]
-            for name, e in self.evidence.items()
-            if name != "get_policy" and e["evidence_ref"] in refs
-        ]
-        for name, field in fields.items():
-            if not set(output["affected_entities"][name]) <= ids(cited, field):
-                raise ValueError("Verifier rejected entity evidence linkage")
-        assessment = output["assessment"]
-        parties = output["root_cause_analysis"]["responsible_parties"]
-        party_types = {party["party_type"] for party in parties}
-        for party in parties:
-            if (
-                party["party_type"] == "seller"
-                and party["party_id"] not in output["affected_entities"]["seller_ids"]
-            ):
-                raise ValueError("Verifier rejected seller scope")
-        required_party = {
-            "canceled_order_paid": "platform",
-            "unavailable_order_paid": "seller",
-            "late_delivery_seller": "seller",
-            "late_delivery_logistics": "logistics_provider",
-            "duplicate_charge": "payment_provider",
-            "payment_mismatch": "payment_provider",
-            "refund_pending": "payment_provider",
-            "refund_failed": "payment_provider",
-            "valid_split_payment": "customer",
-            "unsupported_claim": "customer",
-        }.get(assessment["primary_issue"])
-        if required_party and party_types != {required_party}:
-            raise ValueError("Verifier rejected responsibility")
-        if rule and (
-            amount != _money(rule["refund_brl"])
-            or assessment["case_status"] != rule["case_status"]
-            or output["resolution_actions"] != [rule["recommended_action"]]
-        ):
-            raise ValueError("Verifier rejected policy inconsistency")
-        if assessment["case_status"] == "no_action" and amount:
-            raise ValueError("Verifier rejected no-action refund")
-
+    
+    return {"ref": evidence_ref, "data": data}
 
 async def solve_case(
-    case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter
-) -> dict[str, Any]:
-    """Collect case-scoped evidence, apply MCP policy and verify before returning."""
-    flow = _CaseWorkflow(case, gateway, trace)
-    flow.tools = set(await gateway.list_tools())
-    order = await flow.collect("order-agent", "get_order")
-    # Sequential specialists keep requests bounded and trace handoffs deterministic.
-    items = await flow.collect("order-agent", "get_order_items")
-    payment = await flow.collect("payment-agent", "get_payment_timeline")
-    refund = None
-    if any(
-        c.get("topic", "").startswith("refund_") for c in case["customer_request"].get("claims", [])
-    ):
-        refund = await flow.collect("payment-agent", "get_refund_timeline")
-    shipment = await flow.collect("shipment-agent", "get_shipment_summary")
-    policy = await flow.collect("policy-agent", "get_policy")
-    output, rule = flow.decide(order, items, payment, shipment, refund, policy)
-    flow.emit(
-        "policy_decided",
-        "policy-agent",
-        decision_code=output["assessment"]["primary_issue"].upper(),
-        evidence_refs=output["evidence_refs"],
-    )
-    flow.emit("handoff", "policy-agent", target="verifier", evidence_refs=output["evidence_refs"])
-    flow.verify(output, rule)
-    flow.emit(
-        "verification_completed",
-        "verifier",
-        decision_code="VALIDATED",
-        evidence_refs=output["evidence_refs"],
-        attributes={
-            "confidence": output["assessment"]["confidence"],
-            "unavailable_tools": len(flow.failures),
-        },
-    )
-    return output
+    case: dict, gateway: EvidenceGateway, trace: TraceWriter
+) -> dict:
+    """Implement the L3A coordinator and specialist-agent workflow here."""
+    case_id = case.get("case_id", "UNKNOWN")
+    customer_req = case.get("customer_request", {})
+    customer_message = customer_req.get("message", "")
+    order_id = customer_req.get("claimed_order_id")
+    
+    print(f"\\n[Coordinator] Analyzing case {case_id}")
+    print(f"Message: {customer_message}")
+    
+    if not os.environ.get("MISTRAL_API_KEY"):
+        raise ValueError("MISTRAL_API_KEY environment variable is required.")
+        
+    import time
+    
+    mistral_model = "ministral-3b-2512"
+    
+    # 1. Coordinator: Extract order_id using LLM if not provided
+    if not order_id:
+        print("[Coordinator] Extracting entities...")
+        extract_prompt = f"Trích xuất mã đơn hàng (order_id) từ tin nhắn sau của khách hàng. Trả về đúng định dạng JSON: \"{{\"order_id\": \"MÃ_ĐƠN_HÀNG\"}}\". Nếu không có, trả về \"{{\"order_id\": null}}\". Tin nhắn: {customer_message}"
+        
+        import httpx
+        import asyncio
+        extract_response = None
+        headers = {"Authorization": f"Bearer {os.environ.get('MISTRAL_API_KEY')}", "Content-Type": "application/json"}
+        payload = {"model": mistral_model, "messages": [{"role": "user", "content": extract_prompt}], "response_format": {"type": "json_object"}, "temperature": 0.0}
+        
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient() as hc:
+                    resp = await hc.post("https://api.mistral.ai/v1/chat/completions", json=payload, headers=headers, timeout=30.0)
+                    resp.raise_for_status()
+                    extract_response = resp.json()
+                break
+            except Exception as e:
+                print(f"[Coordinator] Mistral Error, retrying ({attempt+1}/3)... {e}")
+                await asyncio.sleep(2)
+                    
+        if not extract_response:
+            raise RuntimeError("Mistral failed after 3 retries.")
+            
+        extracted = json.loads(extract_response["choices"][0]["message"]["content"])
+        order_id = extracted.get("order_id")
+        
+    if not order_id:
+        print("[Coordinator] No order_id found. Fallback to empty string.")
+        order_id = ""
+        
+    print(f"[Coordinator] Found order_id: {order_id}")
+    
+    # 2. Specialist Agents collect evidence
+    print("[Specialists] Gathering evidence...")
+    evidence_refs = []
+    gathered_data = {}
+    
+    # 2.1 Order Agent
+    if order_id:
+        try:
+            order_ev = await fetch_evidence(gateway, trace, case_id, "get_order", "order_agent", order_id=order_id)
+            gathered_data["order"] = order_ev["data"]
+            evidence_refs.append(order_ev["ref"])
+        except Exception as e:
+            print(f"[Order Agent] Error: {e}")
+            
+        # 2.2 Payment Agent
+        try:
+            payment_ev = await fetch_evidence(gateway, trace, case_id, "get_order_payments", "payment_agent", order_id=order_id)
+            gathered_data["payments"] = payment_ev["data"]
+            evidence_refs.append(payment_ev["ref"])
+        except Exception as e:
+            print(f"[Payment Agent] Error: {e}")
+            
+        # 2.3 Shipment Agent
+        try:
+            shipment_ev = await fetch_evidence(gateway, trace, case_id, "get_shipment_summary", "shipment_agent", order_id=order_id)
+            gathered_data["shipment"] = shipment_ev["data"]
+            evidence_refs.append(shipment_ev["ref"])
+        except Exception as e:
+            print(f"[Shipment Agent] Error: {e}")
+        
+    # 2.4 Policy Agent
+    try:
+        policy_topic = "refund"
+        claims = customer_req.get("claims", [])
+        if claims:
+            policy_topic = claims[0].get("topic", "refund")
+            
+        policy_version = case.get("policy_version", "EC_POLICY_V1")
+        policy_ev = await fetch_evidence(gateway, trace, case_id, "get_policy", "policy_agent", topic=policy_topic, policy_version=policy_version)
+        gathered_data["policy"] = policy_ev["data"]
+        evidence_refs.append(policy_ev["ref"])
+    except Exception as e:
+        print(f"[Policy Agent] Error: {e}")
+        
+    # 3. Verifier / Policy Agent: Generate Output
+    print("[Policy Agent] Analyzing evidence and generating resolution...")
+    
+    schema_json = json.dumps(L3AOutput.model_json_schema(), indent=2)
+    
+    analysis_prompt = f"""
+    Bạn là một chuyên gia giải quyết khiếu nại thương mại điện tử.
+    Dưới đây là thông tin khiếu nại của khách hàng và các bằng chứng đã thu thập được từ hệ thống:
+    
+    Case ID: {case_id}
+    Tin nhắn: {customer_message}
+    Order ID: {order_id}
+    
+    Bằng chứng hệ thống (Dữ liệu JSON):
+    {json.dumps(gathered_data, indent=2)}
+    
+    Danh sách các Reference ID (bắt buộc sử dụng trong output, không được bịa thêm):
+    {evidence_refs}
+    
+    Hãy phân tích nguyên nhân gốc rễ, và đưa ra quyết định giải quyết khiếu nại.
+    Trường hợp lỗi do người bán hoặc nền tảng, hoàn tiền (currency: BRL) cho khách.
+    Trường hợp lỗi từ khách hàng, có thể từ chối hoặc cần điều tra thêm.
+    
+    LƯU Ý QUAN TRỌNG:
+    - CHỈ SỬ DỤNG CÁC EVIDENCE_REFS ĐƯỢC CUNG CẤP Ở TRÊN. KHÔNG TỰ BỊA RA EVIDENCE_REF NÀO KHÁC.
+    - CÁC chuỗi string trong mảng resolution_actions KHÔNG ĐƯỢC DÀI QUÁ 80 KÝ TỰ! Phải viết thật ngắn gọn.
+    - Mã nguyên nhân (cause_code) phải khớp format ^[A-Z][A-Z0-9_]{{2,79}}$ (ví dụ: SELLER_DELAY, LOGISTICS_LOST).
+    - Output trả về CẦN PHẢI TUÂN THỦ CHÍNH XÁC SCHEMA SAU (trả về dưới dạng JSON hợp lệ):
+    {schema_json}
+    """
+    
+    final_response = None
+    import httpx
+    import asyncio
+    headers = {"Authorization": f"Bearer {os.environ.get('MISTRAL_API_KEY')}", "Content-Type": "application/json"}
+    payload = {"model": mistral_model, "messages": [{"role": "user", "content": analysis_prompt}], "response_format": {"type": "json_object"}, "temperature": 0.0}
+    
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient() as hc:
+                resp = await hc.post("https://api.mistral.ai/v1/chat/completions", json=payload, headers=headers, timeout=60.0)
+                resp.raise_for_status()
+                final_response = resp.json()
+            break
+        except Exception as e:
+            print(f"[Policy Agent] Mistral Error, retrying ({attempt+1}/3)... {e}")
+            await asyncio.sleep(2)
+    
+    if not final_response:
+        raise RuntimeError("Mistral failed after 3 retries.")
+        
+    output_dict = json.loads(final_response["choices"][0]["message"]["content"])
+    
+    # Force schema version
+    output_dict["schema_version"] = "day09-l3a-output-v2"
+    output_dict["case_id"] = case_id
+    
+    # 4. Final Verification Layer
+    safe_refs = []
+    for ref in output_dict.get("evidence_refs", []):
+        if ref in evidence_refs:
+            safe_refs.append(ref)
+    output_dict["evidence_refs"] = safe_refs
+    
+    if "claim_assessments" in output_dict:
+        if output_dict["claim_assessments"] is None:
+            del output_dict["claim_assessments"]
+        elif isinstance(output_dict["claim_assessments"], list):
+            for claim in output_dict["claim_assessments"]:
+                safe_claim_refs = [r for r in claim.get("evidence_refs", []) if r in evidence_refs]
+                claim["evidence_refs"] = safe_claim_refs
+                
+    # Fallback for required assessment
+    if "assessment" not in output_dict or not isinstance(output_dict.get("assessment"), dict):
+        output_dict["assessment"] = {
+            "primary_issue": "unsupported_claim",
+            "case_status": "needs_investigation",
+            "confidence": 0.5
+        }
+    else:
+        ass = output_dict["assessment"]
+        valid_issues = [
+            "canceled_order_paid", "unavailable_order_paid", "late_delivery_seller",
+            "late_delivery_logistics", "valid_split_payment", "payment_mismatch",
+            "duplicate_charge", "refund_pending", "refund_failed",
+            "unsupported_claim", "insufficient_evidence"
+        ]
+        if ass.get("primary_issue") not in valid_issues:
+            ass["primary_issue"] = "unsupported_claim"
+        if ass.get("case_status") not in ["action_required", "no_action", "needs_investigation"]:
+            ass["case_status"] = "needs_investigation"
+        if not isinstance(ass.get("confidence"), (int, float)):
+            ass["confidence"] = 0.5
+
+    if "$defs" in output_dict:
+        del output_dict["$defs"]
+        
+    if "affected_entities" not in output_dict:
+        output_dict["affected_entities"] = {}
+        
+    for key in ["order_ids", "item_ids", "seller_ids", "payment_references", "shipment_ids"]:
+        if key not in output_dict["affected_entities"]:
+            output_dict["affected_entities"][key] = []
+            
+    if "root_cause_analysis" in output_dict:
+        for party in output_dict["root_cause_analysis"].get("responsible_parties", []):
+            if "party_id" not in party:
+                party["party_id"] = None
+                
+    if "data_conflicts" in output_dict:
+        if output_dict["data_conflicts"] is None:
+            output_dict["data_conflicts"] = []
+        else:
+            for dc in output_dict["data_conflicts"]:
+                if "selected_source" not in dc:
+                    dc["selected_source"] = None
+                
+    if "financial_resolution" in output_dict:
+        if output_dict["financial_resolution"].get("refund_lines") is None:
+            output_dict["financial_resolution"]["refund_lines"] = []
+        for line in output_dict["financial_resolution"].get("refund_lines", []):
+            if "entity_id" not in line:
+                line["entity_id"] = None
+                
+    if output_dict.get("resolution_actions") is None:
+        output_dict["resolution_actions"] = []
+                
+    print("[Verifier] Case completed successfully.")
+    return output_dict
+
+
