@@ -50,6 +50,12 @@ class EvidenceGateway:
         self._tools = {tool.name: tool for tool in specs}
         return specs
 
+    async def describe_tools(self) -> list[dict[str, Any]]:
+        """Return JSON-serializable MCP tool descriptions for local discovery."""
+        response = await self._session.list_tools()
+        tools = [tool.model_dump(mode="json", by_alias=True) for tool in response.tools]
+        return sorted(tools, key=lambda tool: str(tool.get("name", "")))
+
     async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
         if self._tools is None:
             raise RuntimeError("MCP tools must be discovered before calling a tool")

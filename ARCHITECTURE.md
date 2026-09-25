@@ -1,62 +1,81 @@
 # L3A Architecture Record
 
-Team phải cập nhật tài liệu này cùng source. Mục tiêu là mô tả quyết định có thể kiểm chứng, không ghi prompt bí mật hoặc chain-of-thought.
+Tài liệu mô tả kiến trúc có thể kiểm chứng của bài nộp. Không chứa API key, prompt bí
+mật hoặc chain-of-thought.
 
 ## 1. System overview
 
-Luồng từ `inputs/<case_id>.json` đến MCP, các agent, output và trace:
-
 ```text
-Input → Coordinator → concurrent MCP collector
-                              ↓
-             Order/Payment ───┬─── Shipment/Seller (conditional)
-                              └─── Policy/Resolution
-                              ↓ join
-                           Verifier → output builder → Output + Trace
+inputs/<case_id>.json
+        │
+        ▼
+   Coordinator ── task_assigned ──┬── Order/item agent ── MCP
+        │                         ├── Payment agent ───── MCP
+        │                         ├── Shipment agent ──── MCP
+        │                         └── Policy agent ────── MCP
+        │                                  │
+        └──────── validated handoffs ◄─────┘
+                           │
+                           ▼
+              Deterministic candidate output
+                           │
+                           ▼
+             Qwen3 8B verifier + invariants
+                           │
+                           ▼
+                schema-validated output
 ```
 
-LangGraph giữ state riêng cho từng case. Ba specialist dùng chung Qwen3 1.7B và được gọi
-đồng thời với concurrency tối đa 3. Shipment/Seller được skip deterministic khi không có
-claim giao hàng. Verifier chỉ được trả một nhiệm vụ bổ sung về đúng một specialist;
-collector chỉ gọi tool mới được discovery và graph chặn vòng sửa thứ hai.
+`cli.py` đọc tuần tự 100 case. Mỗi case được xử lý trong cùng một MCP session, nhưng
+mọi state evidence trong `workflow.py` chỉ tồn tại trong phạm vi lời gọi `solve_case`.
+CLI validate output ngay trước khi ghi file theo phương thức temporary-file replace.
 
 ## 2. Agent ownership
 
-| Actor | Input | Trách nhiệm | Output/handoff |
-| --- | --- | --- | --- |
-| Coordinator | Case, claims, discovered tool metadata | Xác định focus và tool cần dùng; không gọi MCP | Task riêng cho ba specialist |
-| Order/Payment | Task và evidence tài chính | Order, item, payment và refund | Finding + evidence refs |
-| Shipment/Seller | Task và evidence giao hàng | Timeline và seller/logistics responsibility; skip nếu không liên quan | Finding + evidence refs hoặc skipped |
-| Policy/Resolution | Policy và fact MCP rút gọn | Quyền lợi, refund cap và action | Policy finding + evidence refs |
-| Verifier | Tất cả domain findings và evidence rút gọn | Kiểm tra provenance, consistency, confidence | Decision hoặc một correction task có mục tiêu |
+| Actor | Input | Trách nhiệm | Tool được phép gọi | Output/handoff |
+| --- | --- | --- | --- | --- |
+| Coordinator | Case, claims, policy version | Chọn tool tối thiểu theo issue, giao việc, tổng hợp | Không gọi trực tiếp ngoài kế hoạch | Candidate output |
+| Order/item agent | `case_id`, `order_id` | Xác minh order, item và seller liên quan | `get_order`, `get_order_items`, `get_sellers` | Order/entity facts + evidence refs |
+| Payment agent | `case_id`, `order_id` | Xác minh payment, duplicate, mismatch và refund lifecycle | `get_order_payments`, `get_payment_timeline`, `get_refund_timeline` | Payment/refund facts + evidence refs |
+| Shipment agent | `case_id`, `order_id` | Xác minh giao trễ và actor chịu trách nhiệm | `get_shipment_summary` | Shipment facts + evidence ref |
+| Policy agent | `case_id`, `policy_version` | Lấy rule, status, action, refund và responsible party | `get_policy` | Policy decision + evidence ref |
+| Verifier | Case, candidate, evidence data | So sánh issue bằng model 8B và chạy invariant xác định | Không gọi MCP | `verification_completed` |
 
-Tool ownership được tạo từ kết quả discovery. Coordinator và verifier chỉ đề xuất tên tool;
-collector deterministic gọi đồng thời các tool độc lập sau khi kiểm tra tên và input schema.
-Coordinator và verifier không trực tiếp gọi MCP.
-
-Tool chỉ được gọi nếu tên thật sự xuất hiện trong discovery và payload pass input
-schema do MCP công bố.
-
-Nêu rõ actor nào được quyền gọi tool nào. Tránh cho mọi agent quyền truy vấn tất cả tool nếu không cần thiết.
+Tool plan nằm trong `ISSUE_TOOLS`. Mỗi actor chỉ nhận tool thuộc domain của mình.
 
 ## 3. A2A protocol
 
-Message nội bộ gồm `case_id`, `task_id`, `sender`, `recipient`, `kind`, `payload`,
-`evidence_refs` và `retry_count`. Mỗi handoff giữ nguyên `case_id`; message không được
-đưa vào public output. Graph có cạnh cố định và `correction_count <= 1`, vì vậy không
-thể hình thành vòng lặp vô hạn. Trace chỉ chứa event, actor, decision code và evidence
-observable; không chứa prompt hay chain-of-thought.
+Handoff nội bộ dùng `EvidenceRecord`:
+
+```text
+tool_name, actor, evidence_ref, domain, data, warnings
+```
+
+`case_id` là correlation key duy nhất và luôn được truyền trực tiếp vào mọi MCP call.
+Lifecycle quan sát được:
+
+```text
+case_received → task_assigned → tool_result_consumed → handoff
+              → policy_decided → verification_completed → case_finalized
+```
+
+Workflow không có vòng lặp agent tự do. Tool plan hữu hạn theo issue, mỗi tool được gọi
+tối đa một lần trong một case, vì vậy không thể phát sinh vòng lặp vô hạn.
 
 ## 4. Evidence lifecycle
 
-Mỗi `solve_case` tạo evidence store mới. MCP envelope được validate trước khi lưu nguyên
-`evidence_ref`, `result_hash`, domain và data. Evidence được gắn actor/tool, emit
-`tool_result_consumed` ngay khi chuyển cho specialist sở hữu domain, rồi verifier chỉ được chọn ref
-có trong store của case hiện tại. Output builder chỉ giữ ref verifier/claim đã chọn, loại
-ref lạ và không tự map fallback theo topic. Entity ID cũng phải xuất hiện trong dữ liệu MCP;
-claimed order ID trong customer message không tự động trở thành dữ liệu có thẩm quyền.
+1. Coordinator lấy issue được khách hàng claim nhưng chưa coi đó là ground truth.
+2. Tool plan yêu cầu evidence có thẩm quyền ở đúng domain.
+3. `EvidenceGateway` validate mọi response bằng public MCP evidence schema.
+4. Specialist kiểm tra lifecycle fact cụ thể trước khi xác nhận issue.
+5. `evidence_ref` được giữ nguyên, không sửa hoặc tự sinh.
+6. Evidence được handoff về coordinator và map vào output/claim assessment.
+7. Policy chỉ được áp dụng khi domain evidence thật sự hỗ trợ issue.
+8. State evidence bị hủy khi `solve_case` kết thúc, tránh dùng chéo case.
 
-## 5. Failure policy
+Model chỉ nhận facts tối thiểu đã loại bỏ message, ID, evidence ref và timestamp để kiểm
+tra issue. Model không được tạo hoặc sửa evidence refs, số tiền hay action. Candidate
+cuối vẫn bị kiểm tra bằng invariant xác định.
 
 | Failure | Retry? | Fallback | Trace event/code |
 | --- | --- | --- | --- |
@@ -65,22 +84,23 @@ claimed order ID trong customer message không tự động trở thành dữ li
 | Source conflict | Không | Verifier chọn nguồn hoặc để unresolved | `verification_completed`; conflict vào output |
 | Invalid agent result | 1 structured repair | Dừng case nếu vẫn sai | Không ghi nội dung sai vào trace |
 
-Retry phải có giới hạn và idempotent. Không chuyển missing evidence thành dữ liệu phỏng đoán.
+Model mặc định là `qwen/qwen3-8b` qua OpenRouter. Model có 8,2B tham số và đáp ứng
+yêu cầu dưới 10B. Allowlist trong `model_client.py` chỉ cho phép:
 
-## 6. Verification invariants
+- `qwen/qwen3-8b`;
+- `qwen/qwen3-8b:free`.
 
-Trước finalize, output builder và contract validator kiểm tra:
+Cấu hình:
 
-- đúng case ID và đúng public output schema, không field ngoài schema;
-- mọi evidence ref thuộc store của case và claim refs là tập con hợp lệ;
-- entity list duy nhất, đúng độ dài và chỉ chứa ID có trong evidence;
-- confidence nằm trong `[0, 1]`;
-- refund không âm và tổng `refund_lines` bằng `recommended_refund_brl`;
-- refund/action kéo theo `action_required`;
-- cause rank liên tục, party/action không trùng;
-- đủ lifecycle trace và event đúng schema.
+```dotenv
+OPENROUTER_API_KEY=sk-or-v1-...
+OPENROUTER_MODEL=qwen/qwen3-8b
+```
 
-## 7. Reproducibility
+Request dùng temperature 0, JSON mode, giới hạn 500 output token và tắt reasoning
+output. Nếu model lỗi hoặc trả JSON sai, deterministic candidate vẫn được giữ nhưng
+confidence bị hạ và trace ghi `MODEL_UNAVAILABLE`. Nếu model bất đồng, trace ghi
+`MODEL_DISAGREED` và confidence cũng bị giới hạn.
 
 Mặc định dùng Ollama OpenAI-compatible tại `http://127.0.0.1:11434/v1`, temperature
 0 và structured JSON output. Model assignment:

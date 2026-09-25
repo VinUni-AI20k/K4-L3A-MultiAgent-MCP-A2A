@@ -13,6 +13,7 @@ from .config import Settings
 from .contracts import Contracts
 from .llm import LLMClient
 from .mcp_gateway import connect_gateway
+from .model_client import OpenRouterClient
 from .submission import package_submission, validate_artifacts
 from .trace import TraceWriter
 from .workflow import AgentModels, solve_case
@@ -22,12 +23,15 @@ def _root(value: str) -> Path:
     return Path(value).resolve()
 
 
-async def _show_tools(root: Path) -> None:
+async def _show_tools(root: Path, *, as_json: bool = False) -> None:
     settings = Settings.load(root)
     contracts = Contracts(root / "contracts" / "schemas")
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        for tool in await gateway.list_tools():
-            print(tool)
+        if as_json:
+            print(json.dumps(await gateway.describe_tools(), ensure_ascii=False, indent=2))
+        else:
+            for tool in await gateway.list_tools():
+                print(tool)
 
 
 async def _start_competition_run(settings: Settings, case_set: CaseSet) -> None:
@@ -187,7 +191,7 @@ def main() -> None:
                 f"{len(case_set.case_ids)} cases"
             )
         elif args.command == "mcp-tools":
-            asyncio.run(_show_tools(root))
+            asyncio.run(_show_tools(root, as_json=args.json))
         elif args.command == "run":
             asyncio.run(_run(root, resume=args.resume))
         elif args.command == "validate":
