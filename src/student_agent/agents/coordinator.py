@@ -1,0 +1,284 @@
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from ..mcp_gateway import EvidenceGateway
+from ..models import OrderLogisticsResult, PaymentResolutionResult
+from ..trace import TraceWriter
+from .order_logistics import OrderLogisticsAgent
+from .payment_resolution import PaymentResolutionAgent
+from .verifier import Verifier
+
+logger = logging.getLogger(__name__)
+
+
+class CoordinatorAgent:
+    """Agent Điều phối trung tâm A2A và tổng hợp kết luận cuối cùng (Chử Trần Phương Nam)."""
+
+    def __init__(self, verifier: Verifier, actor_name: str = "coordinator") -> None:
+        self.actor_name = actor_name
+        self.verifier = verifier
+        self.order_agent = OrderLogisticsAgent()
+        self.payment_agent = PaymentResolutionAgent()
+
+    async def coordinate(
+        self,
+        case: dict[str, Any],
+        gateway: EvidenceGateway,
+        trace: TraceWriter,
+    ) -> dict[str, Any]:
+        case_id = case["case_id"]
+
+        # Pha 1: Phân công Order & Logistics Agent (Ngụy Khắc Phi Long)
+        trace.emit(
+            case_id=case_id,
+            event_type="task_assigned",
+            actor=self.actor_name,
+            target=self.order_agent.actor_name,
+        )
+        order_res: OrderLogisticsResult = await self.order_agent.investigate(case, gateway, trace)
+        trace.emit(
+            case_id=case_id,
+            event_type="handoff",
+            actor=self.order_agent.actor_name,
+            target=self.actor_name,
+        )
+
+        # Pha 2: Phân công Payment & Resolution Agent (Nguyễn Đức Phát) kèm theo context đơn hàng
+        trace.emit(
+            case_id=case_id,
+            event_type="task_assigned",
+            actor=self.actor_name,
+            target=self.payment_agent.actor_name,
+        )
+        payment_res: PaymentResolutionResult = await self.payment_agent.investigate(
+            case, gateway, trace, order_res
+        )
+        trace.emit(
+            case_id=case_id,
+            event_type="handoff",
+            actor=self.payment_agent.actor_name,
+            target=self.actor_name,
+        )
+
+        # Pha 3: Tổng hợp phán quyết (Synthesis & Root Cause)
+        primary_issue, case_status, confidence = self._determine_assessment(case, order_res, payment_res)
+        root_cause = self._build_root_cause(primary_issue, order_res, payment_res)
+
+        # Gom toàn bộ bằng chứng
+        all_evidence = list(dict.fromkeys(order_res.evidence_refs + payment_res.evidence_refs))
+
+        # Gom thực thể
+        affected_entities = {
+            "order_ids": order_res.order_ids,
+            "item_ids": order_res.item_ids,
+            "seller_ids": order_res.seller_ids,
+            "payment_references": payment_res.payment_references,
+            "shipment_ids": order_res.shipment_ids,
+        }
+
+        # Resolution actions
+        actions = list(payment_res.resolution_actions)
+        if primary_issue == "late_delivery_seller":
+            actions = ["penalize_seller", "notify_customer"]
+        elif primary_issue == "late_delivery_logistics":
+            actions = ["file_carrier_claim", "notify_customer"]
+        elif primary_issue == "valid_split_payment" or case_status == "no_action":
+            actions = ["notify_customer"]
+        elif not actions:
+            actions = ["investigate_further"]
+
+        # Late delivery: payment agent may spuriously detect duplicate_charge on these orders.
+        # Policy remedy is vendor penalty/carrier claim, not a customer refund.
+        if primary_issue in ("late_delivery_seller", "late_delivery_logistics"):
+            final_refund_brl = 0.0
+            final_refund_lines: list[dict[str, Any]] = []
+        elif case_status == "no_action":
+            final_refund_brl = 0.0
+            final_refund_lines = []
+        else:
+            final_refund_brl = payment_res.recommended_refund_brl
+            final_refund_lines = payment_res.refund_lines
+
+        # Phát hiện data_conflicts khi số tiền thanh toán lệch với tổng đơn hàng.
+        # Only report when the mismatch IS the root cause (payment_mismatch); otherwise
+        # the discrepancy is already explained by the primary issue (canceled, duplicate, etc.).
+        data_conflicts: list[dict[str, Any]] = []
+        if (
+            primary_issue == "payment_mismatch"
+            and order_res.order_total_brl > 0
+            and payment_res.total_paid_brl > 0
+            and abs(payment_res.total_paid_brl - order_res.order_total_brl) >= 0.50
+        ):
+            data_conflicts.append({
+                "field": "order_total_brl",
+                "sources": ["get_order_items", "get_order_payments"],
+                "selected_source": "get_order_payments",
+                "resolution_code": "PREFER_PAYMENT_RECORD",
+            })
+
+        # Fix claim verdicts for requested_full_refund to match final financial_resolution.
+        # payment_res may have computed a refund (e.g. from spurious duplicate_charge detection)
+        # that the coordinator later zeroes out (late_delivery, no_action). Keep verdicts consistent.
+        claims_input = case.get("customer_request", {}).get("claims", [])
+        claims_by_id = {cl["claim_id"]: cl for cl in claims_input}
+        fixed_claim_assessments = []
+        for ca in payment_res.claim_assessments:
+            ca_copy = dict(ca)
+            topic = claims_by_id.get(ca["claim_id"], {}).get("topic", "")
+            if topic == "requested_full_refund":
+                ca_copy["verdict"] = "supported" if final_refund_brl > 0 else "unsupported"
+            fixed_claim_assessments.append(ca_copy)
+
+        raw_output: dict[str, Any] = {
+            "schema_version": "day09-l3a-output-v2",
+            "case_id": case_id,
+            "assessment": {
+                "primary_issue": primary_issue,
+                "case_status": case_status,
+                "confidence": confidence,
+            },
+            "affected_entities": affected_entities,
+            "claim_assessments": fixed_claim_assessments,
+            "root_cause_analysis": root_cause,
+            "evidence_refs": all_evidence,
+            "data_conflicts": data_conflicts,
+            "financial_resolution": {
+                "currency": "BRL",
+                "recommended_refund_brl": final_refund_brl,
+                "refund_lines": final_refund_lines,
+            },
+            "resolution_actions": actions,
+        }
+
+        # Pha 4: Thẩm định an toàn (Đỗ Thành Đạt)
+        verified_output = self.verifier.verify(raw_output)
+        trace.emit(
+            case_id=case_id,
+            event_type="verification_completed",
+            actor="verifier",
+        )
+
+        return verified_output
+
+    def _determine_assessment(
+        self, case: dict[str, Any], order_res: OrderLogisticsResult, pay_res: PaymentResolutionResult
+    ) -> tuple[str, str, float]:
+        """Quyết định primary_issue dựa trên việc xác thực Claim mà khách khiếu nại."""
+        customer_req = case.get("customer_request", {})
+        claims = customer_req.get("claims", [])
+
+        # Confidence calibration: varies by evidence quality AND outcome certainty.
+        # high (hi) = clear evidence + affirmative action
+        # mid = uncertain/pending states (needs_investigation)
+        # lo  = denial/fallback (unsupported_claim) — hedge against false negatives
+        total_ev = len(order_res.evidence_refs) + len(pay_res.evidence_refs)
+        hi  = 0.92 if total_ev >= 5 else (0.82 if total_ev >= 3 else 0.72)
+        mid = 0.75 if total_ev >= 5 else (0.65 if total_ev >= 3 else 0.55)
+        lo  = 0.82 if total_ev >= 5 else (0.72 if total_ev >= 3 else 0.62)
+
+        # Lấy claimed topic cốt lõi (bỏ qua requested_full_refund vì đó là yêu cầu bồi thường)
+        claimed_topic = None
+        for cl in claims:
+            t = cl.get("topic")
+            if t and t != "requested_full_refund":
+                claimed_topic = t
+                break
+
+        # 1. Nếu khách khiếu nại về giao hàng trễ
+        if claimed_topic in ["late_delivery_seller", "late_delivery_logistics"]:
+            if order_res.is_late:
+                target_issue = order_res.suggested_issue or claimed_topic
+                return target_issue, "action_required", hi
+            else:
+                return "unsupported_claim", "no_action", lo
+
+        # 2. Nếu khách khiếu nại về đơn bị hủy/không có hàng
+        if claimed_topic in ["canceled_order_paid", "unavailable_order_paid"]:
+            if order_res.order_status in ["canceled", "unavailable"]:
+                return claimed_topic, "action_required", hi
+            else:
+                return "unsupported_claim", "no_action", lo
+
+        # 3. Nếu khách khiếu nại về hoàn tiền (pending hoặc failed)
+        if claimed_topic == "refund_pending":
+            if pay_res.refund_status == "pending":
+                return "refund_pending", "needs_investigation", mid
+            return "unsupported_claim", "no_action", lo
+
+        if claimed_topic == "refund_failed":
+            if pay_res.refund_status == "failed":
+                return "refund_failed", "action_required", hi
+            return "unsupported_claim", "no_action", lo
+
+        # 4. Nếu khách khiếu nại về trừ trùng (duplicate charge)
+        if claimed_topic == "duplicate_charge":
+            if pay_res.is_duplicate_charge:
+                return "duplicate_charge", "action_required", hi
+            return "unsupported_claim", "no_action", lo
+
+        # 5. Nếu khách khiếu nại về chia thanh toán hợp lệ (valid_split_payment)
+        if claimed_topic == "valid_split_payment":
+            return "valid_split_payment", "no_action", hi
+
+        # 6. Nếu khách khiếu nại về lệch tiền thanh toán (payment_mismatch)
+        if claimed_topic == "payment_mismatch":
+            if pay_res.is_payment_mismatch:
+                return "payment_mismatch", "action_required", hi
+            return "unsupported_claim", "no_action", lo
+
+        # 7. Nếu khách khiếu nại vô căn cứ (unsupported_claim)
+        if claimed_topic == "unsupported_claim":
+            return "unsupported_claim", "no_action", lo
+
+        # Fallback dựa trên phát hiện của agent nếu không có claim rõ ràng
+        if pay_res.suggested_issue:
+            st = "needs_investigation" if pay_res.suggested_issue == "refund_pending" else "action_required"
+            conf = mid if st == "needs_investigation" else lo
+            return pay_res.suggested_issue, st, conf
+
+        if order_res.suggested_issue:
+            return order_res.suggested_issue, "action_required", lo
+
+        return "unsupported_claim", "no_action", lo
+
+    def _build_root_cause(
+        self, primary_issue: str, order_res: OrderLogisticsResult, pay_res: PaymentResolutionResult
+    ) -> dict[str, Any]:
+        """Xây dựng phân tích nguyên nhân gốc rễ và bên chịu trách nhiệm."""
+        responsible_parties: list[dict[str, Any]] = []
+
+        if primary_issue == "late_delivery_seller":
+            seller_id = order_res.seller_ids[0] if order_res.seller_ids else None
+            responsible_parties.append({"party_type": "seller", "party_id": seller_id})
+            cause_code = "SELLER_HANDOFF_DELAY"
+        elif primary_issue == "late_delivery_logistics":
+            responsible_parties.append({"party_type": "logistics_provider", "party_id": None})
+            cause_code = "CARRIER_TRANSIT_DELAY"
+        elif primary_issue in ["canceled_order_paid", "unavailable_order_paid"]:
+            responsible_parties.append({"party_type": "platform", "party_id": None})
+            cause_code = "AUTO_REFUND_FAILURE"
+        elif primary_issue == "duplicate_charge":
+            responsible_parties.append({"party_type": "payment_provider", "party_id": None})
+            cause_code = "PAYMENT_GATEWAY_DUPLICATE_AUTH"
+        elif primary_issue == "payment_mismatch":
+            responsible_parties.append({"party_type": "platform", "party_id": None})
+            cause_code = "CHECKOUT_TOTAL_CALCULATION_MISMATCH"
+        elif primary_issue == "refund_pending":
+            responsible_parties.append({"party_type": "payment_provider", "party_id": None})
+            cause_code = "BANK_PROCESSING_DELAY"
+        elif primary_issue == "refund_failed":
+            responsible_parties.append({"party_type": "payment_provider", "party_id": None})
+            cause_code = "CARD_ISSUER_REJECTED_REFUND"
+        elif primary_issue == "valid_split_payment":
+            responsible_parties.append({"party_type": "customer", "party_id": None})
+            cause_code = "CUSTOMER_AUTHORIZED_MULTI_PAYMENT"
+        else:
+            responsible_parties.append({"party_type": "customer", "party_id": None})
+            cause_code = "CUSTOMER_MISUNDERSTANDING"
+
+        return {
+            "ranked_causes": [{"cause_code": cause_code, "rank": 1}],
+            "responsible_parties": responsible_parties,
+        }
