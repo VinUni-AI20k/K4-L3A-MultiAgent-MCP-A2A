@@ -287,14 +287,10 @@ async def fetch_domain_evidence(
                             entity_id, None, "unavailable", DECISION_UNAVAILABLE, total_attempts
                         )
                     continue
-                except (RuntimeError, ValueError) as exc:
-                    if "not found" in str(exc).lower():
-                        break  # try the next candidate tool for this domain, if any
-                    if attempt > max_retries:
-                        return LookupOutcome(
-                            entity_id, None, "unavailable", DECISION_UNAVAILABLE, total_attempts
-                        )
-                    continue
+                except (RuntimeError, ValueError):
+                    return LookupOutcome(
+                        entity_id, None, "not_found", DECISION_NOT_FOUND, total_attempts
+                    )
                 item = EvidenceItem(
                     domain=domain,
                     entity_id=entity_id,

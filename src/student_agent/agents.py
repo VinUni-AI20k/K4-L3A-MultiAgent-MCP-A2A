@@ -412,7 +412,7 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             "order_not_fulfilled",
             89.0,
             order_id,
-            relevant_domains=("order", "payment", "item", "seller"),
+            relevant_domains=("order", "payment", "seller"),
         )
 
     if primary_claim == "late_delivery_seller":
@@ -427,7 +427,7 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             "refund_freight",
             18.0,
             order_id,
-            relevant_domains=("order", "payment", "shipment", "seller"),
+            relevant_domains=("order", "shipment", "seller"),
         )
 
     if primary_claim == "late_delivery_logistics":
@@ -442,7 +442,7 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             "refund_freight",
             16.0,
             order_id,
-            relevant_domains=("order", "payment", "shipment"),
+            relevant_domains=("order", "shipment"),
         )
 
     if primary_claim == "duplicate_charge":
@@ -532,7 +532,7 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             None,
             0.0,
             None,
-            relevant_domains=("order", "payment", "shipment"),
+            relevant_domains=("order", "shipment"),
         )
 
     delay_owner = _shipment_delay(shipment_items, order_items, item_items)
@@ -548,7 +548,7 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             "refund_freight",
             18.0,
             order_id,
-            relevant_domains=("order", "payment", "shipment", "seller"),
+            relevant_domains=("order", "shipment", "seller"),
         )
     if delay_owner == "logistics":
         return Decision(
@@ -562,7 +562,7 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             "refund_freight",
             16.0,
             order_id,
-            relevant_domains=("order", "payment", "shipment"),
+            relevant_domains=("order", "shipment"),
         )
 
     return Decision(
@@ -576,7 +576,7 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
         None,
         0.0,
         None,
-        relevant_domains=("order", "payment", "shipment"),
+        relevant_domains=("order", "shipment"),
     )
 
 
@@ -596,7 +596,7 @@ def build_data_conflicts(bundle: EvidenceBundle, primary_issue: str = "") -> lis
 
 CLAIM_TOPIC_DOMAINS: dict[str, tuple[str, ...]] = {
     "canceled_order_paid": ("order", "payment"),
-    "unavailable_order_paid": ("order", "payment", "item", "seller"),
+    "unavailable_order_paid": ("order", "payment", "seller"),
     "late_delivery_seller": ("order", "shipment", "seller"),
     "late_delivery_logistics": ("order", "shipment"),
     "duplicate_charge": ("order", "payment"),
@@ -604,7 +604,7 @@ CLAIM_TOPIC_DOMAINS: dict[str, tuple[str, ...]] = {
     "refund_pending": ("order", "payment", "refund"),
     "refund_failed": ("order", "payment", "refund"),
     "valid_split_payment": ("order", "payment"),
-    "unsupported_claim": ("order", "payment", "shipment"),
+    "unsupported_claim": ("order", "shipment"),
     "requested_full_refund": ("order", "payment"),
 }
 
@@ -637,7 +637,14 @@ def build_claim_assessments(
         else:
             verdict = "unsupported"
 
-        claim_domains = CLAIM_TOPIC_DOMAINS.get(topic) or decision.relevant_domains
+        if topic == "requested_full_refund" and decision.primary_issue in {
+            "late_delivery_seller",
+            "late_delivery_logistics",
+        }:
+            claim_domains: tuple[str, ...] = ("order", "shipment")
+        else:
+            claim_domains = CLAIM_TOPIC_DOMAINS.get(topic) or decision.relevant_domains
+
         claim_refs = bundle.refs_for(claim_domains)[:20]
         if not claim_refs:
             claim_refs = bundle.refs_for(decision.relevant_domains)[:20]
@@ -667,25 +674,7 @@ class PolicyAgent:
         bundle: EvidenceBundle,
         trace: TraceWriter,
     ) -> dict[str, Any]:
-        del seeds
-        policy_tools = tools_by_domain.get("policy", [])
-        if policy_tools and gateway:
-            try:
-                p_resp = await gateway.call("get_policy", case_id=case_id, policy_version="EC_POLICY_V1")
-                evidence_ref = p_resp.get("evidence_ref")
-                if evidence_ref:
-                    bundle.add("policy", "EC_POLICY_V1", p_resp.get("data"), evidence_ref, "get_policy")
-                    trace.emit(
-                        case_id=case_id,
-                        event_type="tool_result_consumed",
-                        actor=self.name,
-                        target="policy",
-                        tool_name="get_policy",
-                        evidence_refs=[evidence_ref],
-                    )
-            except Exception:
-                pass
-
+        del seeds, tools_by_domain, gateway
         decision = decide(claims, bundle)
         relevant_refs = bundle.refs_for(decision.relevant_domains)
 
