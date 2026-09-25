@@ -65,6 +65,8 @@ def validate_artifacts(
         raise ValueError("traces/trace.jsonl is missing or not UTF-8") from exc
     normalized_lines: list[str] = []
     seen_events: set[str] = set()
+    events_by_case: dict[str, list[dict[str, Any]]] = {case_id: [] for case_id in expected}
+    evidence_owners: dict[str, str] = {}
     for number, line in enumerate(trace_lines, 1):
         if not line.strip():
             continue
@@ -78,7 +80,46 @@ def validate_artifacts(
         if event["event_id"] in seen_events:
             raise ValueError(f"traces/trace.jsonl:{number}: duplicate event_id")
         seen_events.add(event["event_id"])
+        events_by_case[event["case_id"]].append(event)
+        if event["event_type"] == "tool_result_consumed":
+            for ref in event.get("evidence_refs", []):
+                if ref in evidence_owners and evidence_owners[ref] != event["case_id"]:
+                    raise ValueError("Evidence reference consumed across different cases")
+                evidence_owners[ref] = event["case_id"]
         normalized_lines.append(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+
+    for case_id, output in outputs.items():
+        events = events_by_case[case_id]
+        types = [event["event_type"] for event in events]
+        required = {
+            "case_received",
+            "task_assigned",
+            "handoff",
+            "verification_completed",
+            "case_finalized",
+        }
+        if not required <= set(types):
+            raise ValueError(f"{case_id}: incomplete workflow lifecycle")
+        if types.count("case_received") != 1 or types.count("case_finalized") != 1:
+            raise ValueError(f"{case_id}: repeated lifecycle boundary")
+        if types[0] != "case_received" or types[-1] != "case_finalized":
+            raise ValueError(f"{case_id}: receive/finalize ordering invalid")
+        if types.index("verification_completed") >= types.index("case_finalized"):
+            raise ValueError(f"{case_id}: verification must precede finalization")
+        consumed = {
+            ref
+            for event in events
+            if event["event_type"] == "tool_result_consumed"
+            for ref in event.get("evidence_refs", [])
+        }
+        cited = set(output["evidence_refs"])
+        cited.update(
+            ref for claim in output.get("claim_assessments", []) for ref in claim["evidence_refs"]
+        )
+        if not cited or not cited <= consumed:
+            raise ValueError(f"{case_id}: output evidence is not linked to MCP consumption trace")
+        if len({event["actor"] for event in events}) < 2:
+            raise ValueError(f"{case_id}: missing actor collaboration")
 
     serialized = [json.dumps(value, ensure_ascii=False) for value in outputs.values()]
     if SECRET_PATTERN.search("\n".join([*serialized, *normalized_lines])):
