@@ -12,6 +12,11 @@ from mcp.client.streamable_http import streamable_http_client
 from .contracts import Contracts
 
 
+class ToolExecutionError(Exception):
+    """Raised when an MCP tool returns an error result (e.g. data not found)."""
+    pass
+
+
 class EvidenceGateway:
     def __init__(self, session: ClientSession, contracts: Contracts) -> None:
         self._session = session
@@ -24,14 +29,12 @@ class EvidenceGateway:
     async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
         result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        if result.is_error:
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
-            raise RuntimeError(f"MCP tool {tool_name} failed: {message or 'unknown error'}")
-        evidence = getattr(result, "structuredContent", None)
-        if evidence is None:
-            evidence = getattr(result, "structured_content", None)
+            raise ToolExecutionError(f"MCP tool {tool_name} failed: {message or 'unknown error'}")
+        evidence = getattr(result, "structured_content", None)
         if evidence is None:
             text_blocks = [block.text for block in result.content if getattr(block, "text", None)]
             if len(text_blocks) != 1:

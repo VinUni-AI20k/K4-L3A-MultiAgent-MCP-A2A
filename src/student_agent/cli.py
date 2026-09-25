@@ -40,24 +40,73 @@ async def _run(root: Path) -> None:
     trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
 
-    async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        discovered_tools = await gateway.list_tools()
-        if not discovered_tools:
-            raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
+    # Process cases in batches with concurrent execution
+    batch_size = 20
+    concurrency = 3  # cases at a time within a batch
+    all_case_ids = list(case_set.case_ids)
+
+    async def _process_one(case_id: str, gateway, sem: asyncio.Semaphore) -> None:
+        async with sem:
+            target = output_root / f"{case_id}.json"
+            if target.exists():
+                return
             case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+            trace.emit(
+                case_id=case_id,
+                event_type="case_received",
+                actor="coordinator",
+            )
             output = await solve_case(case, gateway, trace)
             contracts.validate_output(output, f"outputs/{case_id}.json")
             if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
+                raise ValueError(
+                    f"solver returned a mismatched case_id for {case_id}"
+                )
             temporary = target.with_suffix(".json.tmp")
             temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                json.dumps(output, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
             )
             temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+            trace.emit(
+                case_id=case_id,
+                event_type="case_finalized",
+                actor="coordinator",
+            )
+
+    import time
+    start_total = time.time()
+    for batch_start in range(0, len(all_case_ids), batch_size):
+        batch = all_case_ids[batch_start : batch_start + batch_size]
+        batch_end = min(batch_start + batch_size, len(all_case_ids))
+        print(f"[{batch_start + 1}-{batch_end}/{len(all_case_ids)}] Processing...", flush=True)
+        t_batch = time.time()
+        max_connection_retries = 3
+        for conn_attempt in range(max_connection_retries):
+            try:
+                async with connect_gateway(
+                    settings.mcp_endpoint, settings.team_api_key, contracts
+                ) as gateway:
+                    discovered_tools = await gateway.list_tools()
+                    if not discovered_tools:
+                        raise RuntimeError("MCP Gateway returned no tools")
+                    sem = asyncio.Semaphore(concurrency)
+                    tasks = [_process_one(cid, gateway, sem) for cid in batch]
+                    await asyncio.gather(*tasks)
+                print(f"[{batch_end}/{len(all_case_ids)}] Done ({time.time() - t_batch:.1f}s)", flush=True)
+                break  # Batch succeeded
+            except Exception as exc:
+                print(
+                    f"Connection error on batch starting at {batch_start} "
+                    f"(attempt {conn_attempt + 1}/{max_connection_retries}): {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if conn_attempt < max_connection_retries - 1:
+                    await asyncio.sleep(2 * (conn_attempt + 1))
+                else:
+                    raise
+    print(f"All {len(all_case_ids)} cases completed in {time.time() - start_total:.1f}s", flush=True)
 
 
 def parser() -> argparse.ArgumentParser:
