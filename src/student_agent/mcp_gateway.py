@@ -21,10 +21,22 @@ class EvidenceGateway:
         response = await self._session.list_tools()
         return sorted(tool.name for tool in response.tools)
 
+    async def list_tool_details(self) -> list[dict[str, Any]]:
+        """Return only public tool metadata used for runtime discovery."""
+        response = await self._session.list_tools()
+        return [
+            {
+                "name": tool.name,
+                "description": tool.description or "",
+                "input_schema": tool.input_schema,
+            }
+            for tool in sorted(response.tools, key=lambda item: item.name)
+        ]
+
     async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
         result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        if result.is_error:
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
