@@ -34,3 +34,6 @@ dist/*
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Personal working notes (not part of the submission)
+NOTES_*.md

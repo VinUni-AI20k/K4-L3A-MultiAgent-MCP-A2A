@@ -127,8 +127,7 @@ src/student_agent/workflow.py
 Hàm chính:
 
 ```python
-async def solve_case(case, gateway, trace) -> dict:
-    ...
+async def solve_case(case, gateway, trace) -> dict: ...
 ```
 
 Gợi ý có thể tổ chức các vai trò:
