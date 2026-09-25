@@ -9,10 +9,11 @@ from pathlib import Path
 from .cases import load_case_set
 from .config import Settings
 from .contracts import Contracts
+from .llm import LLMClient
 from .mcp_gateway import connect_gateway
 from .submission import package_submission, validate_artifacts
 from .trace import TraceWriter
-from .workflow import solve_case
+from .workflow import AgentModels, solve_case
 
 
 def _root(value: str) -> Path:
@@ -39,6 +40,12 @@ async def _run(root: Path) -> None:
         stale.unlink()
     trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
+    llm = LLMClient.from_settings(settings)
+    models = AgentModels(
+        coordinator=settings.coordinator_model,
+        specialist=settings.specialist_model,
+        verifier=settings.verifier_model,
+    )
 
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
         discovered_tools = await gateway.list_tools()
@@ -47,7 +54,7 @@ async def _run(root: Path) -> None:
         for case_id in case_set.case_ids:
             case = case_set.cases[case_id]
             trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
+            output = await solve_case(case, gateway, trace, llm=llm, models=models)
             contracts.validate_output(output, f"outputs/{case_id}.json")
             if output.get("case_id") != case_id:
                 raise ValueError(f"solver returned a mismatched case_id for {case_id}")

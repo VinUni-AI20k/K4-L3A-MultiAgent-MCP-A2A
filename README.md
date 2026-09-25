@@ -39,6 +39,28 @@ pytest -q
 day09 --help
 ```
 
+### Model local cho multi-agent
+
+Workflow mặc định dùng Ollama qua API tương thích OpenAI và chạy tuần tự:
+
+```bash
+ollama pull qwen3:0.6b
+ollama pull qwen3:1.7b
+ollama pull qwen3:4b
+```
+
+Năm vai trò dùng tổng ngân sách bảo thủ 9.7B: coordinator 0.6B, ba specialist
+1.7B và verifier 4B. Có thể đổi endpoint/model bằng các biến `LLM_*` trong
+`.env`; không đưa API key vào source, output hoặc trace.
+
+Ý nghĩa các thư mục runtime:
+
+- `contracts/`: public contract chỉ đọc, luôn được ưu tiên cao nhất;
+- `inputs/`: yêu cầu/claim ban đầu, không phải ground truth;
+- `outputs/`: JSON kết luận theo từng case;
+- `tests/`: kiểm tra unit, graph, evidence và contract;
+- `traces/`: lifecycle observable của các agent, không chứa chain-of-thought.
+
 ## 2. Đăng ký team
 
 1. Mở `/register` trên Competition Workspace.
