@@ -21,14 +21,40 @@ class EvidenceGateway:
         response = await self._session.list_tools()
         return sorted(tool.name for tool in response.tools)
 
-    async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+    async def describe_tools(self) -> list[dict[str, Any]]:
+        """Return the discoverable metadata needed to call tools without guessing."""
+        response = await self._session.list_tools()
+        descriptions: list[dict[str, Any]] = []
+        for tool in response.tools:
+            schema = getattr(tool, "inputSchema", None)
+            if schema is None:
+                schema = getattr(tool, "input_schema", None)
+            descriptions.append(
+                {
+                    "name": tool.name,
+                    "description": getattr(tool, "description", "") or "",
+                    "input_schema": schema if isinstance(schema, dict) else {},
+                }
+            )
+        return sorted(descriptions, key=lambda item: item["name"])
+
+    async def call(self, tool_name: str, *, case_id: str, **arguments: Any) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
         result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        is_error = getattr(result, "isError", None)
+        if is_error is None:
+            is_error = getattr(result, "is_error", False)
+        if is_error:
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
-            raise RuntimeError(f"MCP tool {tool_name} failed: {message or 'unknown error'}")
+            structured_error = getattr(result, "structuredContent", None)
+            if structured_error is None:
+                structured_error = getattr(result, "structured_content", None)
+            detail = message or "unknown error"
+            if structured_error:
+                detail = f"{detail}; details={json.dumps(structured_error, ensure_ascii=False)}"
+            raise RuntimeError(f"MCP tool {tool_name} failed: {detail}")
         evidence = getattr(result, "structuredContent", None)
         if evidence is None:
             evidence = getattr(result, "structured_content", None)

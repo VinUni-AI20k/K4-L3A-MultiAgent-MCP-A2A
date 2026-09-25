@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import secrets
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +34,7 @@ class TraceWriter:
             "event_id": f"evt_{secrets.token_urlsafe(18)}",
             "case_id": case_id,
             "event_type": event_type,
-            "occurred_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "occurred_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "actor": actor,
         }
         optional = {
