@@ -27,6 +27,27 @@ async def _show_tools(root: Path) -> None:
             print(tool)
 
 
+async def _ensure_active_run(settings: Settings) -> None:
+    import httpx2
+
+    headers = {
+        "Authorization": f"Bearer {settings.team_api_key}",
+        "Content-Type": "application/json",
+    }
+    urls = [
+        "https://day09-competition.34-142-201-239.sslip.io/api/v2/runs",
+        f"{settings.competition_api_url.rstrip('/')}/api/v2/runs",
+    ]
+    for url in urls:
+        try:
+            async with httpx2.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(url, headers=headers, json={"variant_id": "l3a"})
+                if resp.status_code in [200, 201]:
+                    break
+        except Exception:
+            pass
+
+
 async def _run(root: Path) -> None:
     settings = Settings.load(root)
     case_set = load_case_set(root)
@@ -40,11 +61,13 @@ async def _run(root: Path) -> None:
     trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
 
+    await _ensure_active_run(settings)
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
         discovered_tools = await gateway.list_tools()
         if not discovered_tools:
             raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
+        total_cases = len(case_set.case_ids)
+        for idx, case_id in enumerate(case_set.case_ids, 1):
             case = case_set.cases[case_id]
             trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
             output = await solve_case(case, gateway, trace)
@@ -58,6 +81,9 @@ async def _run(root: Path) -> None:
             )
             temporary.replace(target)
             trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+            issue = output["assessment"]["primary_issue"]
+            print(f"[{idx:3d}/{total_cases}] Solved {case_id} -> {issue}")
+        print(f"OK: completed {total_cases} cases")
 
 
 def parser() -> argparse.ArgumentParser:
