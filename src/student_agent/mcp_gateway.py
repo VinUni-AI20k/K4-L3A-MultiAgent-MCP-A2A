@@ -16,22 +16,35 @@ class EvidenceGateway:
     def __init__(self, session: ClientSession, contracts: Contracts) -> None:
         self._session = session
         self._contracts = contracts
+        self._tool_specs: list[dict[str, Any]] | None = None
 
     async def list_tools(self) -> list[str]:
+        return [tool["name"] for tool in await self.list_tool_specs()]
+
+    async def list_tool_specs(self) -> list[dict[str, Any]]:
+        """Return discovered MCP metadata so callers never have to guess tool arguments."""
+        if self._tool_specs is not None:
+            return self._tool_specs
         response = await self._session.list_tools()
-        return sorted(tool.name for tool in response.tools)
+        self._tool_specs = [
+            {
+                "name": tool.name,
+                "description": tool.description or "",
+                "input_schema": tool.input_schema,
+            }
+            for tool in sorted(response.tools, key=lambda item: item.name)
+        ]
+        return self._tool_specs
 
     async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
         result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        if result.is_error:
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
             raise RuntimeError(f"MCP tool {tool_name} failed: {message or 'unknown error'}")
-        evidence = getattr(result, "structuredContent", None)
-        if evidence is None:
-            evidence = getattr(result, "structured_content", None)
+        evidence = result.structured_content
         if evidence is None:
             text_blocks = [block.text for block in result.content if getattr(block, "text", None)]
             if len(text_blocks) != 1:
