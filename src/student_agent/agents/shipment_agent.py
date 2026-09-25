@@ -138,7 +138,7 @@ class ShipmentAgent:
                 shipment_data = raw_data
             elif isinstance(raw_data, list) and len(raw_data) > 0 and isinstance(raw_data[0], dict):
                 shipment_data = raw_data[0]
-        except Exception as exc:
+        except Exception:
             # Record failed tool call attribute via allowed trace event or skip if unavailable
             pass
 
@@ -205,8 +205,10 @@ class ShipmentAgent:
         primary_seller_id = (
             sorted(list(seller_ids_set))[0] if seller_ids_set else None
         )
-        carrier_name = (
-            str(shipment_data.get("carrier_name") or shipment_data.get("logistics_provider") or "logistics_provider")
+        carrier_name = str(
+            shipment_data.get("carrier_name")
+            or shipment_data.get("logistics_provider")
+            or "logistics_provider"
         )
 
         # Check Seller Handover SLA:
@@ -256,7 +258,9 @@ class ShipmentAgent:
                     CauseRank(cause_code="LOGISTICS_DELAY", rank=2).to_dict()
                 )
                 responsible_parties.append(
-                    ResponsibleParty(party_type="logistics_provider", party_id=carrier_name).to_dict()
+                    ResponsibleParty(
+                        party_type="logistics_provider", party_id=carrier_name
+                    ).to_dict()
                 )
         elif logistics_late:
             primary_issue = "late_delivery_logistics"

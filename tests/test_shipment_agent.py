@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -147,7 +146,7 @@ async def test_shipment_agent_late_delivery_logistics(
                     "shipping_limit_date": "2018-01-10T12:00:00Z",
                     "order_delivered_carrier_date": "2018-01-09T12:00:00Z",  # Dispatched on time!
                     "order_estimated_delivery_date": "2018-01-15T12:00:00Z",
-                    "order_delivered_customer_date": "2018-01-20T12:00:00Z",  # 5 days carrier delay!
+                    "order_delivered_customer_date": "2018-01-20T12:00:00Z",  # 5-day carrier delay
                     "carrier_name": "logistics_partner_1",
                 },
             }
