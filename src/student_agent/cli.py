@@ -6,6 +6,8 @@ import json
 import sys
 from pathlib import Path
 
+import httpx2
+
 from .cases import load_case_set
 from .config import Settings
 from .contracts import Contracts
@@ -19,16 +21,35 @@ def _root(value: str) -> Path:
     return Path(value).resolve()
 
 
+def _activate_run(settings: Settings) -> str:
+    response = httpx2.post(
+        f"{settings.competition_api_url}/api/v2/runs",
+        headers={
+            "Authorization": f"Bearer {settings.team_api_key}",
+            "Content-Type": "application/json",
+        },
+        json={"variant_id": "l3a"},
+        timeout=30.0,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"failed to activate L3A run: {response.text[:300]}")
+    payload = response.json()
+    endpoint = payload.get("mcp_endpoint")
+    return endpoint if isinstance(endpoint, str) and endpoint else settings.mcp_endpoint
+
+
 async def _show_tools(root: Path) -> None:
     settings = Settings.load(root)
+    mcp_endpoint = _activate_run(settings)
     contracts = Contracts(root / "contracts" / "schemas")
-    async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
+    async with connect_gateway(mcp_endpoint, settings.team_api_key, contracts) as gateway:
         for tool in await gateway.list_tools():
             print(tool)
 
 
 async def _run(root: Path) -> None:
     settings = Settings.load(root)
+    mcp_endpoint = _activate_run(settings)
     case_set = load_case_set(root)
     contracts = Contracts(root / "contracts" / "schemas")
     output_root = root / "outputs"
@@ -40,7 +61,7 @@ async def _run(root: Path) -> None:
     trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
 
-    async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
+    async with connect_gateway(mcp_endpoint, settings.team_api_key, contracts) as gateway:
         discovered_tools = await gateway.list_tools()
         if not discovered_tools:
             raise RuntimeError("MCP Gateway returned no tools")
