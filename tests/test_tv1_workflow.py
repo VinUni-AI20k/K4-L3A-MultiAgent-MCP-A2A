@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from mcp.types import CallToolResult, TextContent
 
 from student_agent.agents import adjudicator
 from student_agent.agents.base import BaseAgent, EvidenceLedger
@@ -17,6 +18,7 @@ from student_agent.agents.order_agent import OrderAgent
 from student_agent.agents.payment_agent import PaymentAgent
 from student_agent.agents.shipment_agent import ShipmentAgent
 from student_agent.contracts import Contracts
+from student_agent.mcp_gateway import EvidenceGateway
 from student_agent.trace import TraceWriter
 from student_agent.workflow import solve_case
 
@@ -161,6 +163,29 @@ def test_crashing_specialist_does_not_break_case(
     output, events = run_case(tmp_path)
     assert output["case_id"] == CASE["case_id"]
     assert any(e.get("decision_code") == "agent_error" for e in events)
+
+
+# ── Real EvidenceGateway với MCP session giả (mcp>=2 dùng is_error) ────────
+
+
+class _FakeSession:
+    def __init__(self, result: CallToolResult) -> None:
+        self.result = result
+
+    async def call_tool(self, name: str, arguments: dict) -> CallToolResult:
+        return self.result
+
+
+def test_gateway_reads_mcp2_results() -> None:
+    envelope = asyncio.run(FakeGateway().call("get_order", case_id="L3A_CASE_900"))
+    ok = CallToolResult(content=[], structured_content=envelope)
+    gateway = EvidenceGateway(_FakeSession(ok), CONTRACTS)
+    assert asyncio.run(gateway.call("get_order", case_id="L3A_CASE_900")) == envelope
+
+    failed = CallToolResult(content=[TextContent(type="text", text="not found")], is_error=True)
+    gateway = EvidenceGateway(_FakeSession(failed), CONTRACTS)
+    with pytest.raises(RuntimeError, match="not found"):
+        asyncio.run(gateway.call("get_order", case_id="L3A_CASE_900"))
 
 
 # ── Adjudicator ───────────────────────────────────────────────────────────
