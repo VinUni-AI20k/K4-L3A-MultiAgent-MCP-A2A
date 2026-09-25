@@ -649,9 +649,27 @@ class VerifierSpecialist:
             all_case_evidence_refs,
         )
 
-        # 2. Invariant 1 & 2: Link strictly relevant evidence_refs to each claim assessment
+        # 2. Extract customer claims map
+        customer_claims = case.get("customer_request", {}).get("claims") or []
+        claim_topics = {c.get("claim_id"): c.get("topic") for c in customer_claims}
+
+        # 3. Invariant 1 & 2: Link strictly relevant evidence_refs to each claim assessment
         for ca in verdict.claim_assessments:
-            ca["evidence_refs"] = scoped_evidence[:]
+            cid = ca.get("claim_id")
+            topic = claim_topics.get(cid, verdict.primary_issue)
+            claim_ev = self._select_scoped_claim_evidence(
+                topic,
+                verdict.primary_issue,
+                order_ctx,
+                payment_ctx,
+                shipment_ctx,
+                policy_ref,
+                scoped_evidence,
+            )
+            ca["evidence_refs"] = claim_ev
+            for ref in claim_ev:
+                if ref not in scoped_evidence:
+                    scoped_evidence.append(ref)
 
         clean_evidence_refs = sorted(scoped_evidence)
 
