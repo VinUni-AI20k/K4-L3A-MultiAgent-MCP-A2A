@@ -1,13 +1,40 @@
-# L3A Architecture Record
+# L3A Architecture Record — Team LANGXIMI
 
-Team phải cập nhật tài liệu này cùng source. Mục tiêu là mô tả quyết định có thể kiểm chứng, không ghi prompt bí mật hoặc chain-of-thought.
+Tài liệu thiết kế kiến trúc hệ thống Multi-Agent điều tra khiếu nại thương mại điện tử (K4-L3A Multi-Agent MCP + A2A).
 
 ## 1. System overview
 
+Quy trình xử lý tuần tự từ case input đến các specialist agent, MCP Gateway, Verifier và tạo ra Output + Trace:
+
 ```text
-Input → Coordinator → Specialists (order/payment/shipment) → Policy agent → Verifier → Output
-                         │                                        │             │
-                         └──────────────── MCP Evidence Gateway ──┴─── Trace ────┘
+[inputs/<case_id>.json]
+         │
+         ▼
+ ┌───────────────┐  task_assigned   ┌───────────────────────┐
+ │  Coordinator  ├─────────────────►│   order_specialist    │──┐
+ └───────┬───────┘                  └───────────┬───────────┘  │
+         │                                      │ call/consume │
+         │                          ┌───────────▼───────────┐  │
+         │                          │  MCP Evidence Gateway │  │
+         │                          └───────────┬───────────┘  │
+         │                                      │              │
+         │                          ┌───────────▼───────────┐  │
+         │  handoff                 │   payment_specialist  │◄─┘
+         │                          └───────────┬───────────┘
+         │                                      │ handoff
+         │                          ┌───────────▼───────────┐
+         │                          │  shipment_specialist  │
+         │                          └───────────┬───────────┘
+         │                                      │ handoff
+         │                          ┌───────────▼───────────┐
+         │                          │   policy_specialist   │
+         │                          └───────────┬───────────┘
+         │                                      │ policy_decided + handoff
+         │                                      ▼
+         │                          ┌───────────────────────┐
+         │◄─────────────────────────┤       verifier        │
+         ▼   verification_completed └───────────────────────┘
+[outputs/<case_id>.json] & [traces/trace.jsonl]
 ```
 
 `solve_case()` (`src/student_agent/workflow.py`) implements the coordinator. It fetches
