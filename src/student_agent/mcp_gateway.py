@@ -24,7 +24,7 @@ class EvidenceGateway:
     async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
         result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        if getattr(result, "is_error", getattr(result, "isError", False)):
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
@@ -47,8 +47,9 @@ async def connect_gateway(
 ) -> AsyncIterator[EvidenceGateway]:
     headers = {"Authorization": f"Bearer {team_api_key}"}
     timeout = httpx2.Timeout(300.0, connect=30.0, write=30.0, pool=30.0)
+    # Fix intermittent connection issues on Windows with trust_env=False
     async with (
-        httpx2.AsyncClient(headers=headers, timeout=timeout) as http_client,
+        httpx2.AsyncClient(headers=headers, timeout=timeout, trust_env=False) as http_client,
         streamable_http_client(endpoint, http_client=http_client) as (read_stream, write_stream),
         ClientSession(read_stream, write_stream) as session,
     ):
