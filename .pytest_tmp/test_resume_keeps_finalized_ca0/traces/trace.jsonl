@@ -1,0 +1,2 @@
+{"schema_version":"day09-trace-event-v1","event_id":"evt_4_6UiSAoF9GwME7w798Vj3Sx","case_id":"CASE_001","event_type":"case_received","occurred_at":"2026-09-25T04:56:38.467803Z","actor":"coordinator"}
+{"schema_version":"day09-trace-event-v1","event_id":"evt_MYckXQtW94Heu8cdyvhUwvYd","case_id":"CASE_001","event_type":"case_finalized","occurred_at":"2026-09-25T04:56:38.468571Z","actor":"coordinator"}

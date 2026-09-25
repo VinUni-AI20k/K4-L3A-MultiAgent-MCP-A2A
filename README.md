@@ -151,6 +151,12 @@ day09 run
 day09 validate
 ```
 
+`day09 run` có checkpoint theo case. Nếu MCP hoặc LLM gián đoạn, chạy lại cùng lệnh:
+case đã có output hợp lệ và trace `case_finalized` sẽ được bỏ qua; trace dở của case
+chưa hoàn thành sẽ được loại trước khi case đó chạy lại. Mỗi case tự reconnect và retry
+tối đa 5 lần trước khi dừng batch. Chỉ chạy `day09 validate` sau khi batch báo hoàn thành
+đủ 100 case.
+
 Kết quả được tạo tại:
 
 ```text
