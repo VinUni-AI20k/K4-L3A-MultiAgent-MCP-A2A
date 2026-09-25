@@ -56,7 +56,7 @@ async def connect_gateway(
     endpoint: str, team_api_key: str, contracts: Contracts
 ) -> AsyncIterator[EvidenceGateway]:
     headers = {"Authorization": f"Bearer {team_api_key}"}
-    timeout = httpx2.Timeout(300.0, connect=30.0, write=30.0, pool=30.0)
+    timeout = httpx2.Timeout(300.0, connect=60.0, read=300.0, write=60.0, pool=60.0)
     async with (
         httpx2.AsyncClient(headers=headers, timeout=timeout) as http_client,
         streamable_http_client(endpoint, http_client=http_client) as (read_stream, write_stream),
