@@ -8,7 +8,7 @@
 | Mục | Chi tiết |
 | :--- | :--- |
 | **Khóa / Lớp** | K4 |
-| **Tên nhóm** | **ILV** (Mã đội thi: `h201-02910`) |
+| **Tên nhóm** | **ILV** (Mã đội thi: `ILV - h201-02910`) |
 | **Dự án** | K4 L3A — Multi-Agent MCP + A2A |
 | **Chủ đề** | Hệ thống Multi-Agent tự trị điều tra khiếu nại thương mại điện tử qua MCP |
 | **Ngày hoàn thành** | 25/09/2026 |
