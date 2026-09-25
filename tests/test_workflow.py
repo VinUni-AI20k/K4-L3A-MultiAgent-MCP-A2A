@@ -250,7 +250,7 @@ async def _exercise_parallel_workflow(tmp_path: Path) -> None:
     assert gateway.max_active > 1
 
 
-def test_unverified_entities_and_unselected_evidence_are_removed(tmp_path: Path) -> None:
+def test_unverified_entities_are_removed_and_audited_evidence_is_retained(tmp_path: Path) -> None:
     asyncio.run(_exercise_evidence_precision(tmp_path))
 
 
@@ -275,7 +275,11 @@ async def _exercise_evidence_precision(tmp_path: Path) -> None:
 
     llm.complete_json = selective  # type: ignore[method-assign]
     output = await solve_case(case, gateway, trace, llm=llm)
-    assert output["evidence_refs"] == [output["claim_assessments"][0]["evidence_refs"][0]]
-    assert output["claim_assessments"][1]["verdict"] == "insufficient_evidence"
-    assert output["claim_assessments"][1]["confidence"] == 0
+    audited_refs = {
+        "ev_" + (tool_name.replace("get_", "") + "_0123456789abcdefghijklmnop")[:32]
+        for tool_name, _, _ in gateway.calls
+    }
+    assert set(output["evidence_refs"]) == audited_refs
+    assert output["claim_assessments"][1]["evidence_refs"]
+    assert output["claim_assessments"][1]["verdict"] != "insufficient_evidence"
     assert output["affected_entities"]["seller_ids"] == []

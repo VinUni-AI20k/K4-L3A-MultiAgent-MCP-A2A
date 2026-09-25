@@ -6,7 +6,9 @@ import json
 import sys
 from pathlib import Path
 
-from .cases import load_case_set
+import httpx
+
+from .cases import CaseSet, load_case_set
 from .config import Settings
 from .contracts import Contracts
 from .llm import LLMClient
@@ -26,6 +28,30 @@ async def _show_tools(root: Path) -> None:
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
         for tool in await gateway.list_tools():
             print(tool)
+
+
+async def _start_competition_run(settings: Settings, case_set: CaseSet) -> None:
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"{settings.competition_api_url}/api/v2/runs",
+                headers={"Authorization": f"Bearer {settings.team_api_key}"},
+                json={"variant_id": case_set.variant_id},
+            )
+            response.raise_for_status()
+            run = response.json()
+    except (httpx.HTTPError, json.JSONDecodeError) as exc:
+        raise RuntimeError("could not create the competition run") from exc
+    if (
+        run.get("variant_id") != case_set.variant_id
+        or run.get("case_set_version") != case_set.version
+    ):
+        raise RuntimeError("competition run does not match the local case-set")
+    print(
+        f"RUN: {run['variant_id']} / {run['case_set_version']} / "
+        f"expires {run.get('expires_at', 'unknown')}",
+        flush=True,
+    )
 
 
 def _resume_cases(
@@ -81,6 +107,10 @@ async def _run(root: Path, *, resume: bool = False) -> None:
     if resume:
         completed = _resume_cases(root, case_set.case_ids, contracts)
     else:
+        # A fresh run establishes the scope used by the MCP audit and the scorer.
+        # Resume must not rotate this scope because completed evidence refs belong
+        # to the already-active run.
+        await _start_competition_run(settings, case_set)
         completed = set()
         for stale in output_root.glob("*.json"):
             stale.unlink()
@@ -114,6 +144,8 @@ async def _run(root: Path, *, resume: bool = False) -> None:
             contracts.validate_output(output, f"outputs/{case_id}.json")
             if output.get("case_id") != case_id:
                 raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+            if not output.get("evidence_refs"):
+                raise RuntimeError(f"solver returned no auditable evidence for {case_id}")
             target = output_root / f"{case_id}.json"
             temporary = target.with_suffix(".json.tmp")
             temporary.write_text(

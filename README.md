@@ -176,6 +176,11 @@ day09 run
 day09 validate
 ```
 
+`day09 run` tạo một Competition run mới trước khi gọi MCP để evidence và submission
+cùng audit scope. Không mở lại workspace hoặc tạo run khác trong lúc lệnh đang chạy.
+`day09 run --resume` giữ nguyên run hiện tại; cần resume và nộp bài trước thời điểm run
+hết hạn được in ở đầu lệnh.
+
 Nếu run bị ngắt, dùng `day09 run --resume`. Chỉ các case có output đúng contract và có
 event `case_finalized` mới được bỏ qua; trace của case đang chạy được ghi tạm rồi mới ghép
 vào trace chung để tránh làm hỏng toàn bộ tiến độ.
