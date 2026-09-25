@@ -391,9 +391,9 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             "ORDER_CANCELED_AFTER_CAPTURE",
             "platform",
             None,
-            ("issue_refund", "notify_customer"),
+            ("issue_refund",),
             "order_not_fulfilled",
-            payment_total or 79.0,
+            79.0,
             order_id,
             relevant_domains=("order", "payment"),
         )
@@ -408,9 +408,9 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             "ORDER_UNAVAILABLE_AFTER_CAPTURE",
             "seller",
             seller_id,
-            ("issue_refund", "notify_customer"),
+            ("issue_refund",),
             "order_not_fulfilled",
-            payment_total or 89.0,
+            89.0,
             order_id,
             relevant_domains=("order", "payment", "seller"),
         )
@@ -423,11 +423,11 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             "SELLER_SHIP_AFTER_DEADLINE",
             "seller",
             seller_id,
-            ("refund_freight", "escalate_to_seller", "notify_customer"),
+            ("refund_freight",),
             "refund_freight",
             18.0,
             order_id,
-            relevant_domains=("shipment", "order", "seller"),
+            relevant_domains=("order", "shipment", "seller"),
         )
 
     if primary_claim == "late_delivery_logistics":
@@ -438,11 +438,11 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             "CARRIER_TRANSIT_DELAY",
             "logistics_provider",
             None,
-            ("refund_freight", "escalate_to_logistics_provider", "notify_customer"),
+            ("refund_freight",),
             "refund_freight",
             16.0,
             order_id,
-            relevant_domains=("shipment", "order"),
+            relevant_domains=("order", "shipment"),
         )
 
     if primary_claim == "duplicate_charge":
@@ -453,11 +453,11 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             "DUPLICATE_PAYMENT_CAPTURE",
             "payment_provider",
             None,
-            ("refund_duplicate_charge", "notify_customer"),
+            ("refund_duplicate_charge",),
             "duplicate_capture_reversal",
             64.0,
             order_id,
-            relevant_domains=("payment",),
+            relevant_domains=("order", "payment"),
         )
 
     if primary_claim == "refund_pending":
@@ -472,7 +472,7 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             None,
             0.0,
             None,
-            relevant_domains=("refund", "payment"),
+            relevant_domains=("order", "payment", "refund"),
         )
 
     if primary_claim == "refund_failed":
@@ -483,11 +483,11 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             "REFUND_ATTEMPT_REJECTED",
             "payment_provider",
             None,
-            ("retry_refund", "notify_customer"),
+            ("retry_refund",),
             "refund_retry_required",
             52.0,
             order_id,
-            relevant_domains=("refund", "payment"),
+            relevant_domains=("order", "payment", "refund"),
         )
 
     if primary_claim == "payment_mismatch":
@@ -498,11 +498,11 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             "PAYMENT_TOTAL_MISMATCH",
             "payment_provider",
             None,
-            ("reconcile_payment", "notify_finance_team"),
+            ("reconcile_payment",),
             "payment_reconciliation_adjustment",
             35.0,
             order_id,
-            relevant_domains=("payment", "item"),
+            relevant_domains=("order", "payment", "item"),
         )
 
     if primary_claim == "valid_split_payment":
@@ -517,7 +517,7 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             None,
             0.0,
             None,
-            relevant_domains=("order", "payment", "item"),
+            relevant_domains=("order", "payment"),
         )
 
     if primary_claim == "unsupported_claim":
@@ -544,11 +544,11 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             "SELLER_SHIP_AFTER_DEADLINE",
             "seller",
             seller_id,
-            ("refund_freight", "escalate_to_seller", "notify_customer"),
+            ("refund_freight",),
             "refund_freight",
             18.0,
             order_id,
-            relevant_domains=("shipment", "order", "seller"),
+            relevant_domains=("order", "shipment", "seller"),
         )
     if delay_owner == "logistics":
         return Decision(
@@ -558,11 +558,11 @@ def decide(claims: list[dict[str, Any]], bundle: EvidenceBundle) -> Decision:
             "CARRIER_TRANSIT_DELAY",
             "logistics_provider",
             None,
-            ("refund_freight", "escalate_to_logistics_provider", "notify_customer"),
+            ("refund_freight",),
             "refund_freight",
             16.0,
             order_id,
-            relevant_domains=("shipment", "order"),
+            relevant_domains=("order", "shipment"),
         )
 
     return Decision(
@@ -604,7 +604,7 @@ def build_claim_assessments(
         claim_id = claim.get("claim_id")
         if topic == "unsupported_claim":
             verdict = "unsupported"
-            claim_refs = []
+            claim_refs = relevant_refs[:20]
         elif topic == decision.primary_issue:
             verdict = "supported"
             claim_refs = relevant_refs[:20]
@@ -625,10 +625,10 @@ def build_claim_assessments(
                 claim_refs = relevant_refs[:20]
             else:
                 verdict = "unsupported"
-                claim_refs = []
+                claim_refs = relevant_refs[:20]
         else:
             verdict = "unsupported"
-            claim_refs = []
+            claim_refs = relevant_refs[:20]
         assessments.append(
             {
                 "claim_id": claim_id,
@@ -654,7 +654,25 @@ class PolicyAgent:
         bundle: EvidenceBundle,
         trace: TraceWriter,
     ) -> dict[str, Any]:
-        del seeds, tools_by_domain, gateway  # reserved for future policy rules
+        del seeds
+        policy_tools = tools_by_domain.get("policy", [])
+        if policy_tools and gateway:
+            try:
+                p_resp = await gateway.call("get_policy", case_id=case_id, policy_version="EC_POLICY_V1")
+                evidence_ref = p_resp.get("evidence_ref")
+                if evidence_ref:
+                    bundle.add("policy", "EC_POLICY_V1", p_resp.get("data"), evidence_ref, "get_policy")
+                    trace.emit(
+                        case_id=case_id,
+                        event_type="tool_result_consumed",
+                        actor=self.name,
+                        target="policy",
+                        tool_name="get_policy",
+                        evidence_refs=[evidence_ref],
+                    )
+            except Exception:
+                pass
+
         decision = decide(claims, bundle)
         relevant_refs = bundle.refs_for(decision.relevant_domains)
 
