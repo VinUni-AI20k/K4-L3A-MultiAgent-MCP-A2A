@@ -41,17 +41,20 @@ day09 --help
 
 ### Model local cho multi-agent
 
-Workflow mặc định dùng Ollama qua API tương thích OpenAI và chạy tuần tự:
+Workflow mặc định dùng Ollama qua API tương thích OpenAI. Các specialist chạy song song:
 
 ```bash
-ollama pull qwen3:0.6b
 ollama pull qwen3:1.7b
-ollama pull qwen3:4b
 ```
 
-Năm vai trò dùng tổng ngân sách bảo thủ 9.7B: coordinator 0.6B, ba specialist
-1.7B và verifier 4B. Có thể đổi endpoint/model bằng các biến `LLM_*` trong
+Năm vai trò đều dùng Qwen3 1.7B, tổng ngân sách bảo thủ 8.5B. Order/Payment và
+Policy/Resolution luôn chạy song song; Shipment/Seller chỉ gọi model cho claim giao hàng.
+Có thể đổi endpoint/model và khai báo tham số bằng các biến `LLM_*` trong
 `.env`; không đưa API key vào source, output hoặc trace.
+
+Để Ollama phục vụ ba specialist đồng thời trên Windows, đặt `OLLAMA_NUM_PARALLEL=3` rồi
+khởi động lại `ollama serve`. Client dùng context 4096 và giới hạn concurrency bằng
+`LLM_MAX_PARALLEL_SPECIALISTS=3`.
 
 Ý nghĩa các thư mục runtime:
 
@@ -172,6 +175,10 @@ Hoàn thiện mô tả thiết kế trong `ARCHITECTURE.md`.
 day09 run
 day09 validate
 ```
+
+Nếu run bị ngắt, dùng `day09 run --resume`. Chỉ các case có output đúng contract và có
+event `case_finalized` mới được bỏ qua; trace của case đang chạy được ghi tạm rồi mới ghép
+vào trace chung để tránh làm hỏng toàn bộ tiến độ.
 
 Kết quả được tạo tại:
 

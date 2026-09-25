@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any, Protocol
 
+import httpx
 from jsonschema import Draft202012Validator
 from openai import AsyncOpenAI
 
@@ -25,9 +26,14 @@ class JSONModel(Protocol):
 class LLMClient:
     """Small OpenAI-compatible adapter with one bounded structured-output repair."""
 
-    def __init__(self, *, base_url: str, api_key: str, timeout: float) -> None:
+    def __init__(
+        self, *, base_url: str, api_key: str, timeout: float, num_ctx: int = 4096
+    ) -> None:
         self._client = AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
         self._ollama = "127.0.0.1:11434" in base_url or "localhost:11434" in base_url
+        self._ollama_url = base_url.removesuffix("/v1") + "/api/chat"
+        self._num_ctx = num_ctx
+        self._timeout = timeout
 
     @classmethod
     def from_settings(cls, settings: Settings) -> LLMClient:
@@ -35,6 +41,7 @@ class LLMClient:
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
             timeout=settings.llm_timeout_seconds,
+            num_ctx=settings.llm_num_ctx,
         )
 
     async def complete_json(
@@ -58,25 +65,37 @@ class LLMClient:
         ]
         last_error = "unknown structured-output error"
         for attempt in range(2):
-            request: dict[str, Any] = {
-                "model": model,
-                "messages": messages,
-                "temperature": 0,
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {"name": schema_name, "strict": True, "schema": schema},
-                },
-            }
-            if max_tokens is not None:
-                request["max_tokens"] = max_tokens
+            attempt_tokens = (
+                min(max_tokens * (attempt + 1), 4096) if max_tokens is not None else None
+            )
             if self._ollama:
-                request["extra_body"] = {
+                body: dict[str, Any] = {
+                    "model": model, "messages": messages, "stream": False,
                     "think": False,
                     "keep_alive": "30m",
-                    "options": {"num_ctx": 8192},
+                    "format": schema,
+                    "options": {"temperature": 0, "num_ctx": self._num_ctx},
                 }
-            response = await self._client.chat.completions.create(**request)
-            content = response.choices[0].message.content or ""
+                if attempt_tokens is not None:
+                    body["options"]["num_predict"] = attempt_tokens
+                async with httpx.AsyncClient(timeout=self._timeout) as client:
+                    response = await client.post(self._ollama_url, json=body)
+                    response.raise_for_status()
+                content = response.json().get("message", {}).get("content", "")
+            else:
+                request: dict[str, Any] = {
+                    "model": model, "messages": messages, "temperature": 0,
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": schema_name, "strict": True, "schema": schema,
+                        },
+                    },
+                }
+                if attempt_tokens is not None:
+                    request["max_tokens"] = attempt_tokens
+                response = await self._client.chat.completions.create(**request)
+                content = response.choices[0].message.content or ""
             try:
                 value = _decode_object(content)
                 errors = sorted(

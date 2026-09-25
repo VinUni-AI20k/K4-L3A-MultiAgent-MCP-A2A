@@ -4,37 +4,35 @@ Team phải cập nhật tài liệu này cùng source. Mục tiêu là mô tả
 
 ## 1. System overview
 
-Vẽ hoặc mô tả luồng từ `inputs/<case_id>.json` đến MCP calls, specialist agents, verifier, output và trace.
+Luồng từ `inputs/<case_id>.json` đến MCP, các agent, output và trace:
 
 ```text
-Input → Coordinator → Order/Payment → Shipment/Seller → Policy/Resolution → Verifier
-                              │                │                 │              │
-                              └──────────────── MCP ──────────────┴──────────────┤
-                                                                                ↓
-                                                              Output builder → Output + Trace
+Input → Coordinator → concurrent MCP collector
+                              ↓
+             Order/Payment ───┬─── Shipment/Seller (conditional)
+                              └─── Policy/Resolution
+                              ↓ join
+                           Verifier → output builder → Output + Trace
 ```
 
-LangGraph giữ state riêng cho từng case. Các node chạy tuần tự để tránh nhiều model
-tranh chấp VRAM. Verifier được phép trả một nhiệm vụ về đúng một specialist và graph
-chặn vòng sửa thứ hai.
+LangGraph giữ state riêng cho từng case. Ba specialist dùng chung Qwen3 1.7B và được gọi
+đồng thời với concurrency tối đa 3. Shipment/Seller được skip deterministic khi không có
+claim giao hàng. Verifier chỉ được trả một nhiệm vụ bổ sung về đúng một specialist;
+collector chỉ gọi tool mới được discovery và graph chặn vòng sửa thứ hai.
 
 ## 2. Agent ownership
 
 | Actor | Input | Trách nhiệm | Output/handoff |
 | --- | --- | --- | --- |
-| Coordinator | Case, claims, discovered tool metadata | Xác định focus, giao việc; không gọi MCP | Ba task có correlation theo case |
-| Order/payment | Task, order ID | Order, item, payment và refund evidence | Structured finding + evidence refs |
-| Shipment/seller | Task, order ID | Shipment timeline và seller responsibility | Structured finding + evidence refs |
-| Policy/resolution | Task, policy version | Policy, quyền lợi, refund và action | Policy decision + structured finding |
-| Verifier | Tất cả finding và evidence | Kiểm tra provenance, consistency, confidence | Decision hoặc tối đa một correction task |
+| Coordinator | Case, claims, discovered tool metadata | Xác định focus và tool cần dùng; không gọi MCP | Task riêng cho ba specialist |
+| Order/Payment | Task và evidence tài chính | Order, item, payment và refund | Finding + evidence refs |
+| Shipment/Seller | Task và evidence giao hàng | Timeline và seller/logistics responsibility; skip nếu không liên quan | Finding + evidence refs hoặc skipped |
+| Policy/Resolution | Policy và fact MCP rút gọn | Quyền lợi, refund cap và action | Policy finding + evidence refs |
+| Verifier | Tất cả domain findings và evidence rút gọn | Kiểm tra provenance, consistency, confidence | Decision hoặc một correction task có mục tiêu |
 
-Tool ownership được tạo từ kết quả discovery:
-
-- order/payment: `get_order`, `get_order_items`, `get_order_payments`,
-  `get_payment_timeline`, `get_refund_timeline`;
-- shipment/seller: `get_shipment_summary`, `get_sellers`;
-- policy/resolution: `get_policy`;
-- coordinator và verifier không gọi MCP.
+Tool ownership được tạo từ kết quả discovery. Coordinator và verifier chỉ đề xuất tên tool;
+collector deterministic gọi đồng thời các tool độc lập sau khi kiểm tra tên và input schema.
+Coordinator và verifier không trực tiếp gọi MCP.
 
 Tool chỉ được gọi nếu tên thật sự xuất hiện trong discovery và payload pass input
 schema do MCP công bố.
@@ -53,9 +51,10 @@ observable; không chứa prompt hay chain-of-thought.
 
 Mỗi `solve_case` tạo evidence store mới. MCP envelope được validate trước khi lưu nguyên
 `evidence_ref`, `result_hash`, domain và data. Evidence được gắn actor/tool, emit
-`tool_result_consumed` ngay khi chuyển cho specialist, rồi verifier chỉ được chọn ref
-có trong store của case hiện tại. Output builder loại ref lạ và map fallback theo loại
-claim từ các tool đã gọi; không tạo hoặc sửa ref.
+`tool_result_consumed` ngay khi chuyển cho specialist sở hữu domain, rồi verifier chỉ được chọn ref
+có trong store của case hiện tại. Output builder chỉ giữ ref verifier/claim đã chọn, loại
+ref lạ và không tự map fallback theo topic. Entity ID cũng phải xuất hiện trong dữ liệu MCP;
+claimed order ID trong customer message không tự động trở thành dữ liệu có thẩm quyền.
 
 ## 5. Failure policy
 
@@ -64,7 +63,7 @@ claim từ các tool đã gọi; không tạo hoặc sửa ref.
 | MCP timeout/connection tạm thời | Tối đa 2 retry, exponential backoff | Dừng case nếu vẫn lỗi | Lỗi runtime, không tạo evidence |
 | Not found/permanent tool error | Không | Dừng hoặc kết luận thiếu evidence nếu gateway trả envelope hợp lệ | Không tạo ref giả |
 | Source conflict | Không | Verifier chọn nguồn hoặc để unresolved | `verification_completed`; conflict vào output |
-| Invalid specialist result | 1 structured repair | Dừng case nếu vẫn sai | Không ghi nội dung sai vào trace |
+| Invalid agent result | 1 structured repair | Dừng case nếu vẫn sai | Không ghi nội dung sai vào trace |
 
 Retry phải có giới hạn và idempotent. Không chuyển missing evidence thành dữ liệu phỏng đoán.
 
@@ -74,7 +73,7 @@ Trước finalize, output builder và contract validator kiểm tra:
 
 - đúng case ID và đúng public output schema, không field ngoài schema;
 - mọi evidence ref thuộc store của case và claim refs là tập con hợp lệ;
-- entity list duy nhất, đúng độ dài và chứa claimed order ID;
+- entity list duy nhất, đúng độ dài và chỉ chứa ID có trong evidence;
 - confidence nằm trong `[0, 1]`;
 - refund không âm và tổng `refund_lines` bằng `recommended_refund_brl`;
 - refund/action kéo theo `action_required`;
@@ -88,14 +87,20 @@ Mặc định dùng Ollama OpenAI-compatible tại `http://127.0.0.1:11434/v1`, 
 
 | Actor | Model | Budget |
 | --- | --- | ---: |
-| Coordinator | `qwen3:0.6b` | 0.6B |
-| Ba specialist | `qwen3:1.7b` | 5.1B |
-| Verifier | `qwen3:4b` | 4.0B |
-| **Tổng theo vai trò** | | **9.7B** |
+| Coordinator | `qwen3:1.7b` | 1.7B |
+| Order/Payment | `qwen3:1.7b` | 1.7B |
+| Shipment/Seller | `qwen3:1.7b` | 1.7B |
+| Policy/Resolution | `qwen3:1.7b` | 1.7B |
+| Verifier | `qwen3:1.7b` | 1.7B |
+| **Tổng theo vai trò** | | **8.5B** |
 
-Concurrency model là 1; model name, endpoint và timeout được cấu hình bằng `.env`.
+Concurrency giữa case là 1; concurrency specialist tối đa 3. Ollama dùng context 4096 và
+cần được khởi động với `OLLAMA_NUM_PARALLEL=3` để thực thi request song song thực sự.
+Model name, endpoint và timeout được cấu hình bằng `.env`.
 Không ghi API key trong architecture, output hoặc trace. Kiểm tra bằng `pytest -q`,
-`day09 validate-inputs`, `day09 run`, `day09 validate` và `day09 package`.
+`day09 validate-inputs`, `day09 run` (hoặc `--resume`), `day09 validate` và
+`day09 package`. Mỗi case ghi trace vào file tạm; chỉ sau khi output validate thành công
+mới append nguyên tử theo case vào `trace.jsonl`.
 
 ## 8. Repository directories
 
