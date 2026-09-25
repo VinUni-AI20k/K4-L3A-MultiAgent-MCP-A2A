@@ -36,7 +36,9 @@ class OrderAgent:
         # 1. Thu thập bằng chứng Đơn hàng
         order_evidence = None
         try:
-            order_evidence = await self.gateway.call("get_order", case_id=case_id, order_id=claimed_order_id)
+            order_evidence = await self.gateway.call(
+                "get_order", case_id=case_id, order_id=claimed_order_id
+            )
             state["order_data"] = order_evidence["data"]
             state["evidence_refs"].append(order_evidence["evidence_ref"])
             
@@ -54,7 +56,9 @@ class OrderAgent:
         # 2. Thu thập bằng chứng Mặt hàng
         items_evidence = None
         try:
-            items_evidence = await self.gateway.call("get_order_items", case_id=case_id, order_id=claimed_order_id)
+            items_evidence = await self.gateway.call(
+                "get_order_items", case_id=case_id, order_id=claimed_order_id
+            )
             state["items_data"] = items_evidence["data"]
             state["evidence_refs"].append(items_evidence["evidence_ref"])
             
@@ -75,7 +79,9 @@ class OrderAgent:
                 if "product_id" in item:
                     product_id = item["product_id"]
                     try:
-                        product_evidence = await self.gateway.call("get_product_context", case_id=case_id, product_id=product_id)
+                        product_evidence = await self.gateway.call(
+                            "get_product_context", case_id=case_id, product_id=product_id
+                        )
                         state.setdefault("products_data", {})[product_id] = product_evidence["data"]
                         state["evidence_refs"].append(product_evidence["evidence_ref"])
                         self.trace.emit(
@@ -95,7 +101,9 @@ class OrderAgent:
         if order_evidence and "data" in order_evidence and "customer_id" in order_evidence["data"]:
             customer_id = order_evidence["data"]["customer_id"]
             try:
-                customer_evidence = await self.gateway.call("get_customer_history", case_id=case_id, customer_id=customer_id)
+                customer_evidence = await self.gateway.call(
+                    "get_customer_history", case_id=case_id, customer_id=customer_id
+                )
                 state["customer_data"] = customer_evidence["data"]
                 state["evidence_refs"].append(customer_evidence["evidence_ref"])
                 self.trace.emit(
