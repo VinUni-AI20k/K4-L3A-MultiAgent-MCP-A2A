@@ -171,5 +171,4 @@ clean). Checks:
 - Run command: `python -m student_agent.cli run`, followed by
   `python -m student_agent.cli validate` and
   `python -m student_agent.cli package --output dist/submission.zip`.
-- Resource limits: bounded by the MCP Evidence Gateway's own per-call timeout (300s,
-  configured in `mcp_gateway.connect_gateway`); no local resource limits are configured.
+- Resource limits: bounded by the MCP Evidence Gateway's own per-call timeout (300s, configured in `mcp_gateway.connect_gateway`); no local resource limits are configured.
