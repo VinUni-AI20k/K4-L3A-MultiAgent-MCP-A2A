@@ -25,19 +25,27 @@ Làm nhóm hoặc cá nhân, khi fork về các bạn giữ nguyên tên gốc r
 
 Yêu cầu Python 3.11 trở lên.
 
-```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
-cp .env.example .env
+Copy-Item .env.example .env
+```
+
+Nếu PowerShell chặn chạy script khi kích hoạt môi trường ảo, chạy lệnh sau trong cửa sổ hiện tại rồi kích hoạt lại:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```
 
 Kiểm tra:
 
-```bash
+```powershell
 pytest -q
-day09 --help
+python -m student_agent.cli --help
 ```
+
+Các lệnh bên dưới gọi CLI qua Python của môi trường đang kích hoạt (`python -m student_agent.cli`), nên không phụ thuộc PowerShell có tìm thấy `day09.exe` trong `PATH` hay không. Hãy kích hoạt `.venv` của repo trước khi chạy.
 
 ## 2. Đăng ký team
 
@@ -58,9 +66,9 @@ MCP_ENDPOINT=http://127.0.0.1:8001/mcp
 
 Tải ZIP input **L3A** từ GitHub Release và giải nén vào root repo:
 
-```bash
-unzip l3a-inputs-<version>.zip -d .
-day09 validate-inputs
+```powershell
+Expand-Archive -LiteralPath .\l3a-inputs-<version>.zip -DestinationPath .
+python -m student_agent.cli validate-inputs
 ```
 
 Cấu trúc đúng:
@@ -79,8 +87,8 @@ MCP Gateway cung cấp evidence về order, item, payment, shipment, seller và 
 
 Xem các tool hiện có:
 
-```bash
-day09 mcp-tools
+```powershell
+python -m student_agent.cli mcp-tools
 ```
 
 Ví dụ gọi tool trong `workflow.py`:
@@ -146,9 +154,9 @@ Hoàn thiện mô tả thiết kế trong `ARCHITECTURE.md`.
 
 ## 6. Chạy và kiểm tra
 
-```bash
-day09 run
-day09 validate
+```powershell
+python -m student_agent.cli run
+python -m student_agent.cli validate
 ```
 
 Kết quả được tạo tại:
@@ -162,8 +170,8 @@ Nếu output pass schema nhưng điểm thấp, cần kiểm tra lại semantic,
 
 ## 7. Đóng gói và nộp bài
 
-```bash
-day09 package --output dist/submission.zip
+```powershell
+python -m student_agent.cli package --output dist/submission.zip
 ```
 
 ZIP chỉ được chứa:

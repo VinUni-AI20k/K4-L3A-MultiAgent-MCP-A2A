@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import os
+from datetime import datetime, timedelta
+from pathlib import Path
 import re
 from datetime import datetime
 from typing import Any
@@ -7,678 +11,543 @@ from typing import Any
 from .mcp_gateway import EvidenceGateway
 from .trace import TraceWriter
 
-EV_REF_PATTERN = re.compile(r"^ev_[A-Za-z0-9_-]{20,96}$")
+# ponytail: policy's recommended_action / case_status per primary_issue is a fixed
+# global lookup table (verified identical across cases), so get_policy is used as
+# the authority for those two fields. refund_brl / responsible party_id are
+# recomputed per case from real evidence instead of the policy template's constants.
 
-# Which evidence domains matter for each primary issue. Evidence is scored on
-# precision as well as coverage, so a case only cites the tools it truly needs.
-TOOLS_BY_TOPIC: dict[str, tuple[str, ...]] = {
-    "canceled_order_paid": ("get_order", "get_order_payments", "get_policy"),
-    "unavailable_order_paid": (
+# ponytail: every case mixes the real lifecycle (captures at purchase, refunds ~est+1d,
+# shipment events on delivery day) with a decoy block shifted by >=9 days, so windows
+# are anchored to this order's own dates: payment events must sit on the purchase day,
+# refunds/shipment events inside purchase..delivery/estimate. A decoy shifted <1 day
+# would slip through; tighten with per-block grouping if that ever shows up.
+_WINDOW_BEFORE = timedelta(days=1)
+_PAYMENT_WINDOW = timedelta(days=1)
+_WINDOW_AFTER_LIFECYCLE = timedelta(days=2)
+_LATE_EVENT_TOLERANCE = timedelta(days=2)
+
+# ponytail: get_sellers / get_customer_history / get_product_context are deliberately
+# left out of every entry below (and never fetched in solve_case) until the MCP
+# Evidence Gateway is confirmed reachable again and we can verify their response shape
+# and the forbidden-domain evidence penalty ARCHITECTURE.md §2 warns about. Add them
+# back per-issue only once that's confirmed.
+ISSUE_TOOLS: dict[str, list[str]] = {
+    "canceled_order_paid": ["get_order", "get_payment_timeline", "get_policy"],
+    "unavailable_order_paid": [
         "get_order",
         "get_order_items",
-        "get_order_payments",
-        "get_sellers",
-        "get_policy",
-    ),
-    "late_delivery_seller": (
-        "get_order",
-        "get_order_items",
-        "get_shipment_summary",
-        "get_sellers",
-        "get_policy",
-    ),
-    "late_delivery_logistics": (
-        "get_order",
-        "get_order_items",
-        "get_shipment_summary",
-        "get_policy",
-    ),
-    "valid_split_payment": ("get_order", "get_order_payments", "get_policy"),
-    "payment_mismatch": (
-        "get_order",
-        "get_order_items",
-        "get_order_payments",
-        "get_policy",
-    ),
-    "duplicate_charge": (
-        "get_order",
-        "get_order_payments",
         "get_payment_timeline",
         "get_policy",
-    ),
-    "refund_pending": (
+    ],
+    "late_delivery_seller": ["get_order", "get_order_items", "get_shipment_summary", "get_policy"],
+    "late_delivery_logistics": ["get_order", "get_shipment_summary", "get_policy"],
+    "valid_split_payment": ["get_order", "get_order_items", "get_payment_timeline", "get_policy"],
+    "payment_mismatch": ["get_order", "get_payment_timeline", "get_policy"],
+    "duplicate_charge": ["get_order", "get_payment_timeline", "get_policy"],
+    "refund_pending": ["get_order", "get_refund_timeline", "get_policy"],
+    "refund_failed": ["get_order", "get_refund_timeline", "get_policy"],
+    "unsupported_claim": [
         "get_order",
-        "get_order_payments",
-        "get_refund_timeline",
+        "get_order_items",
+        "get_payment_timeline",
+        "get_shipment_summary",
         "get_policy",
-    ),
-    "refund_failed": (
+    ],
+    "insufficient_evidence": [
         "get_order",
-        "get_order_payments",
-        "get_refund_timeline",
+        "get_order_items",
+        "get_payment_timeline",
+        "get_shipment_summary",
         "get_policy",
-    ),
-    "unsupported_claim": ("get_order", "get_shipment_summary", "get_policy"),
+    ],
 }
 
-CAUSE_CODE_BY_TOPIC: dict[str, str] = {
-    "canceled_order_paid": "ORDER_CANCELED_BEFORE_FULFILLMENT",
-    "unavailable_order_paid": "SELLER_INVENTORY_STOCKOUT",
-    "late_delivery_seller": "SELLER_DISPATCH_DELAY",
-    "late_delivery_logistics": "LOGISTICS_TRANSIT_DELAY",
-    "valid_split_payment": "VALID_SPLIT_PAYMENT_TRANSACTION",
-    "payment_mismatch": "PAYMENT_AMOUNT_DISCREPANCY",
-    "duplicate_charge": "PAYMENT_GATEWAY_DUPLICATE_AUTH",
-    "refund_pending": "REFUND_PROCESSING_WITHIN_SLA",
-    "refund_failed": "PAYMENT_GATEWAY_REFUND_FAILURE",
-    "unsupported_claim": "CLAIM_NOT_SUBSTANTIATED_BY_EVIDENCE",
-    "insufficient_evidence": "EVIDENCE_UNAVAILABLE_FROM_GATEWAY",
-}
 
-REFUND_REASON_BY_TOPIC: dict[str, str] = {
-    "canceled_order_paid": "FULL_REFUND_CANCELED_ORDER",
-    "unavailable_order_paid": "FULL_REFUND_UNAVAILABLE_ITEM",
-    "late_delivery_seller": "REFUND_SHIPPING_DELAY_SELLER",
-    "late_delivery_logistics": "REFUND_SHIPPING_DELAY_LOGISTICS",
-    "payment_mismatch": "REFUND_PAYMENT_DISCREPANCY",
-    "duplicate_charge": "REFUND_DUPLICATE_CHARGE",
-    "refund_failed": "RETRY_FAILED_REFUND",
-}
-
-_TOOL_CACHE: dict[int, dict[str, Any]] = {}
+def _money(value: str) -> float:
+    return round(float(value), 2)
 
 
-async def _discover_tools(gateway: EvidenceGateway) -> dict[str, Any]:
-    """List tools once per gateway session; every later case reuses the result."""
-    key = id(gateway._session)
-    cached = _TOOL_CACHE.get(key)
-    if cached is None:
-        response = await gateway._session.list_tools()
-        cached = {tool.name: tool for tool in response.tools}
-        _TOOL_CACHE.clear()
-        _TOOL_CACHE[key] = cached
-    return cached
+def _dt(value: str | None) -> datetime | None:
+    return datetime.fromisoformat(value) if value else None
 
 
-def _as_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+def _in_window(moment: datetime, start: datetime, end: datetime) -> bool:
+    return start - _WINDOW_BEFORE <= moment <= end + _WINDOW_AFTER_LIFECYCLE
 
 
-def _as_rows(data: Any, *keys: str) -> list[dict[str, Any]]:
-    """Normalise a tool payload into a list of records."""
-    if isinstance(data, list):
-        return [row for row in data if isinstance(row, dict)]
-    if isinstance(data, dict):
-        for key in keys:
-            value = data.get(key)
-            if isinstance(value, list):
-                return [row for row in value if isinstance(row, dict)]
-        return [data]
-    return []
-
-
-def _parse_time(value: Any) -> datetime | None:
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        return None
-
-
-async def _safe_call(
+async def _fetch(
     gateway: EvidenceGateway,
-    tool_name: str,
-    *,
+    trace: TraceWriter,
     case_id: str,
+    actor: str,
+    tool_name: str,
     **kwargs: str,
 ) -> dict[str, Any] | None:
     try:
         evidence = await gateway.call(tool_name, case_id=case_id, **kwargs)
-    except Exception as exc:  # a single unavailable domain must not lose the case
-        print(f"[{tool_name} error: {exc}]", end=" ", flush=True)
+    except RuntimeError:
         return None
-    if not isinstance(evidence, dict) or "evidence_ref" not in evidence:
-        print(f"[{tool_name} bad response: {evidence!r}]", end=" ", flush=True)
-        return None
-    ref = evidence["evidence_ref"]
-    if not isinstance(ref, str) or not EV_REF_PATTERN.fullmatch(ref):
-        print(f"[{tool_name} bad ref: {ref!r}]", end=" ", flush=True)
-        return None
+    if os.environ.get("DUMP_EVIDENCE") == "1":
+        dump_path = Path("debug") / case_id / f"{tool_name}.json"
+        dump_path.parent.mkdir(parents=True, exist_ok=True)
+        dump_path.write_text(json.dumps(evidence, indent=2, ensure_ascii=False), encoding="utf-8")
+    trace.emit(
+        case_id=case_id,
+        event_type="tool_result_consumed",
+        actor=actor,
+        tool_name=tool_name,
+        evidence_refs=[evidence["evidence_ref"]],
+    )
     return evidence
+
+
+def _classify(
+    order: dict[str, Any],
+    items: list[dict[str, Any]],
+    shipment: dict[str, Any],
+    pay_timeline: dict[str, Any],
+    refund_timeline: dict[str, Any] | None,
+) -> dict[str, Any]:
+    purchase_at = _dt(order["order_purchase_timestamp"])
+    delivered_customer_at = _dt(order["order_delivered_customer_date"])
+    estimated_at = _dt(order["order_estimated_delivery_date"])
+    delivered_carrier_at = _dt(order["order_delivered_carrier_date"])
+    order_status = order["order_status"]
+    lifecycle_end = max(d for d in (purchase_at, delivered_customer_at, estimated_at) if d)
+
+    def in_lifecycle(value: str) -> bool:
+        return _in_window(_dt(value), purchase_at, lifecycle_end)
+
+    conflicts: list[dict[str, Any]] = []
+
+    def result(issue: str, refund: float, confidence: float) -> dict[str, Any]:
+        return {
+            "primary_issue": issue,
+            "refund_brl": refund,
+            "seller_id": seller_id,
+            "confidence": confidence,
+            "conflicts": conflicts,
+            "good_items": good_items,
+        }
+
+    # ponytail: a repeated order_item_id is a duplicate/reissued record, not a second
+    # line item, so keep only the copy whose shipping_limit_date is closest to purchase.
+    by_item_id: dict[str, dict[str, Any]] = {}
+    for i in items:
+        key = i["order_item_id"]
+        if key not in by_item_id or abs(_dt(i["shipping_limit_date"]) - purchase_at) < abs(
+            _dt(by_item_id[key]["shipping_limit_date"]) - purchase_at
+        ):
+            by_item_id[key] = i
+    good_items = list(by_item_id.values())
+    if len(good_items) != len(items):
+        conflicts.append(
+            {
+                "field": "order_items",
+                "sources": ["get_order_items", "order_purchase_timestamp"],
+                "selected_source": "get_order_items",
+                "resolution_code": "excluded_duplicate_order_item_id_records",
+            }
+        )
+    item_total = round(sum(_money(i["price"]) + _money(i["freight_value"]) for i in good_items), 2)
+    freight_total = round(sum(_money(i["freight_value"]) for i in good_items), 2)
+    seller_id = good_items[0]["seller_id"] if good_items else None
+
+    pay_events = pay_timeline["events"]
+    # A byte-identical event (same instant, type and amount) is a replicated record,
+    # not a second charge: keep one copy.
+    good_pay_events = list(
+        {
+            (e["event_at"], e["event_type"], e["amount_brl"]): e
+            for e in pay_events
+            if abs(_dt(e["event_at"]) - purchase_at) <= _PAYMENT_WINDOW
+        }.values()
+    )
+    if len(good_pay_events) != len(pay_events):
+        conflicts.append(
+            {
+                "field": "payment_events",
+                "sources": ["get_payment_timeline", "order_purchase_timestamp"],
+                "selected_source": "get_payment_timeline",
+                "resolution_code": "excluded_payment_events_outside_order_lifecycle_window",
+            }
+        )
+    good_captured = [e for e in good_pay_events if e["event_type"] == "captured"]
+    captured_total = round(sum(_money(e["amount_brl"]) for e in good_captured), 2)
+    mismatches = [
+        e
+        for e in good_pay_events
+        if e["event_type"] == "reconciliation_mismatch" and e["status"] == "open"
+    ]
+
+    is_late = bool(delivered_customer_at and estimated_at and delivered_customer_at > estimated_at)
+    late_events = [e for e in shipment["events"] if in_lifecycle(e["event_at"])]
+    if len(late_events) != len(shipment["events"]) or bool(late_events) != is_late:
+        conflicts.append(
+            {
+                "field": "delivery_timeliness",
+                "sources": ["order_delivery_dates", "shipment_delivered_late_event"],
+                "selected_source": "order_delivery_dates",
+                "resolution_code": "order_dates_authoritative_over_shipment_event",
+            }
+        )
+
+    refund_events: list[dict[str, Any]] = []
+    if refund_timeline is not None:
+        # A real refund returns money this lifecycle actually captured.
+        captured_amounts = {_money(e["amount_brl"]) for e in good_captured}
+        refund_events = [
+            e
+            for e in refund_timeline["events"]
+            if in_lifecycle(e["event_at"]) and _money(e["amount_brl"]) in captured_amounts
+        ]
+        if len(refund_events) != len(refund_timeline["events"]):
+            conflicts.append(
+                {
+                    "field": "refund_events",
+                    "sources": ["get_refund_timeline", "order_purchase_timestamp"],
+                    "selected_source": "get_refund_timeline",
+                    "resolution_code": "excluded_refund_events_outside_order_lifecycle_window",
+                }
+            )
+
+    if mismatches:
+        return result(
+            "payment_mismatch", round(sum(_money(e["amount_brl"]) for e in mismatches), 2), 0.95
+        )
+
+    if order_status in ("canceled", "unavailable") and captured_total > 0:
+        issue = "canceled_order_paid" if order_status == "canceled" else "unavailable_order_paid"
+        return result(issue, captured_total, 0.95)
+
+    if is_late:
+        matching = [
+            e
+            for e in late_events
+            if abs(_dt(e["event_at"]) - delivered_customer_at) <= _LATE_EVENT_TOLERANCE
+        ]
+        if matching:
+            actor = matching[0]["actor"]
+            confidence = 0.9
+        else:
+            shipping_limits = [_dt(i["shipping_limit_date"]) for i in good_items]
+            actor = (
+                "seller"
+                if delivered_carrier_at
+                and shipping_limits
+                and delivered_carrier_at > min(shipping_limits)
+                else "logistics_provider"
+            )
+            confidence = 0.65
+        issue = "late_delivery_seller" if actor == "seller" else "late_delivery_logistics"
+        # ponytail: freight refund is capped at what this lifecycle actually captured
+        # (logistics cases capture less than the item freight); matches get_policy's refund_brl.
+        refund = min(freight_total, captured_total) if captured_total > 0 else freight_total
+        return result(issue, refund, confidence)
+
+    if refund_events:
+        latest = max(refund_events, key=lambda e: _dt(e["event_at"]))
+        if latest["status"] == "failed":
+            return result("refund_failed", _money(latest["amount_brl"]), 0.95)
+        if latest["status"] == "pending":
+            return result("refund_pending", 0.0, 0.9)
+
+    # The same amount captured more than once within this lifecycle, with the order
+    # overpaid, is one charge taken twice: refund the extra copies.
+    amount_counts: dict[float, int] = {}
+    for e in good_captured:
+        amount = _money(e["amount_brl"])
+        amount_counts[amount] = amount_counts.get(amount, 0) + 1
+    duplicate_amount = round(sum(a * (n - 1) for a, n in amount_counts.items() if n > 1), 2)
+    if duplicate_amount > 0 and captured_total > item_total + 0.01:
+        return result("duplicate_charge", duplicate_amount, 0.95)
+
+    if abs(captured_total - item_total) <= 0.01:
+        if len(good_captured) > 1 or len({p["payment_type"] for p in pay_timeline["payments"]}) > 1:
+            return result("valid_split_payment", 0.0, 0.9)
+        return result("unsupported_claim", 0.0, 0.9)
+
+    return result("insufficient_evidence", 0.0, 0.5)
+
+
+def _claim_verdict(topic: str, primary_issue: str, case_status: str, refund_brl: float) -> str:
+    if topic == "requested_full_refund":
+        if case_status == "action_required" and refund_brl > 0:
+            return "supported"
+        if case_status == "needs_investigation":
+            return "partially_supported"
+        return "unsupported"
+    if topic == primary_issue:
+        return "supported"
+    if primary_issue == "insufficient_evidence":
+        return "insufficient_evidence"
+    return "unsupported"
+
+
+def _verify(output: dict[str, Any], fetched_refs: set[str]) -> list[str]:
+    """Cross-field + provenance sanity checks. Returns problem codes (empty = passed)."""
+    problems: list[str] = []
+    if not set(output["evidence_refs"]).issubset(fetched_refs):
+        problems.append("evidence_ref_not_fetched")
+    for claim in output.get("claim_assessments", []):
+        if not set(claim["evidence_refs"]).issubset(fetched_refs):
+            problems.append("claim_evidence_ref_not_fetched")
+
+    case_status = output["assessment"]["case_status"]
+    financial = output["financial_resolution"]
+    if case_status == "no_action" and (
+        financial["recommended_refund_brl"] != 0 or financial["refund_lines"]
+    ):
+        problems.append("no_action_with_refund")
+    if case_status == "action_required" and financial["recommended_refund_brl"] <= 0:
+        problems.append("action_required_without_refund")
+
+    party = output["root_cause_analysis"]["responsible_parties"][0]
+    if party["party_type"] == "seller" and party["party_id"] is None:
+        problems.append("seller_party_missing_id")
+
+    actions = output["resolution_actions"]
+    if len(actions) != len(set(actions)):
+        problems.append("duplicate_resolution_actions")
+    return problems
 
 
 async def solve_case(
     case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter
 ) -> dict[str, Any]:
-    case_id: str = case["case_id"]
-    customer_request: dict[str, Any] = case.get("customer_request", {})
-    claimed_order_id: str | None = customer_request.get("claimed_order_id")
-    claims: list[dict[str, Any]] = customer_request.get("claims", [])
-    policy_version: str = case.get("policy_version", "EC_POLICY_V1")
-
-    discovered_tools = await _discover_tools(gateway)
-
-    # The claim topic is only a hypothesis: the customer message is not ground truth.
-    claimed_topic = "unsupported_claim"
-    for claim in claims:
-        topic = claim.get("topic")
-        if topic in TOOLS_BY_TOPIC:
-            claimed_topic = topic
-            break
-
-    refs_by_tool: dict[str, str] = {}
-
-    def consume(evidence: dict[str, Any] | None, actor: str, tool_name: str) -> Any:
-        """Record an evidence ref in the trace and return its payload."""
-        if evidence is None:
-            return None
-        ref = evidence.get("evidence_ref")
-        if ref and tool_name not in refs_by_tool:
-            refs_by_tool[tool_name] = ref
-            trace.emit(
-                case_id=case_id,
-                event_type="tool_result_consumed",
-                actor=actor,
-                tool_name=tool_name,
-                evidence_refs=[ref],
-            )
-        return evidence.get("data")
-
-    async def fetch(tool_name: str, actor: str, **kwargs: str) -> Any:
-        if tool_name not in discovered_tools:
-            return None
-        evidence = await _safe_call(gateway, tool_name, case_id=case_id, **kwargs)
-        return consume(evidence, actor, tool_name)
-
-    # -------------------------------------------------------------------------
-    # 1. COORDINATOR — plan which domains this hypothesis needs
-    # -------------------------------------------------------------------------
-    trace.emit(
-        case_id=case_id,
-        event_type="task_assigned",
-        actor="coordinator",
-        target="order_specialist",
-        decision_code="DISPATCH_ORDER_INVESTIGATION",
-        attributes={"claimed_topic": claimed_topic},
-    )
-
-    planned = set(TOOLS_BY_TOPIC.get(claimed_topic, TOOLS_BY_TOPIC["unsupported_claim"]))
-
-    # -------------------------------------------------------------------------
-    # 2. ORDER SPECIALIST
-    # -------------------------------------------------------------------------
-    order_data: dict[str, Any] = {}
-    items: list[dict[str, Any]] = []
-    seller_rows: list[dict[str, Any]] = []
-
-    if claimed_order_id:
-        result = await fetch("get_order", "order_specialist", order_id=claimed_order_id)
-        if isinstance(result, dict):
-            order_data = result
-
-        if "get_order_items" in planned:
-            result = await fetch(
-                "get_order_items", "order_specialist", order_id=claimed_order_id
-            )
-            items = _as_rows(result, "items", "order_items")
-
-        if "get_sellers" in planned:
-            result = await fetch("get_sellers", "order_specialist", order_id=claimed_order_id)
-            seller_rows = _as_rows(result, "sellers")
+    """L3A coordinator: dispatches specialist agents over MCP evidence, classifies
+    the primary issue from evidence (never from the customer's own claim), then asks
+    the policy agent for the authoritative case_status/action before a verifier pass.
+    """
+    case_id = case["case_id"]
+    request = case["customer_request"]
+    order_id = request["claimed_order_id"]
+    policy_version = case["policy_version"]
 
     trace.emit(
-        case_id=case_id,
-        event_type="handoff",
-        actor="order_specialist",
-        target="payment_specialist",
+        case_id=case_id, event_type="task_assigned", actor="coordinator", target="order-agent"
+    )
+    order_ev = await _fetch(gateway, trace, case_id, "order-agent", "get_order", order_id=order_id)
+    items_ev = await _fetch(
+        gateway, trace, case_id, "order-agent", "get_order_items", order_id=order_id
     )
 
-    # -------------------------------------------------------------------------
-    # 3. PAYMENT SPECIALIST
-    # -------------------------------------------------------------------------
-    payments: list[dict[str, Any]] = []
-    payment_events: list[dict[str, Any]] = []
-    refund_events: list[dict[str, Any]] = []
-
-    if claimed_order_id:
-        if "get_order_payments" in planned:
-            result = await fetch(
-                "get_order_payments", "payment_specialist", order_id=claimed_order_id
-            )
-            payments = _as_rows(result, "payments", "order_payments")
-
-        if "get_payment_timeline" in planned:
-            result = await fetch(
-                "get_payment_timeline", "payment_specialist", order_id=claimed_order_id
-            )
-            if isinstance(result, dict):
-                payment_events = _as_rows(result.get("events", []))
-                if not payments:
-                    payments = _as_rows(result.get("payments", []))
-
-        if "get_refund_timeline" in planned:
-            result = await fetch(
-                "get_refund_timeline", "payment_specialist", order_id=claimed_order_id
-            )
-            if isinstance(result, dict):
-                refund_events = _as_rows(result.get("events", []))
-
-    trace.emit(
-        case_id=case_id,
-        event_type="handoff",
-        actor="payment_specialist",
-        target="shipment_specialist",
-    )
-
-    # -------------------------------------------------------------------------
-    # 4. SHIPMENT SPECIALIST
-    # -------------------------------------------------------------------------
-    shipment_data: dict[str, Any] = {}
-    shipment_events: list[dict[str, Any]] = []
-    if claimed_order_id and "get_shipment_summary" in planned:
-        result = await fetch(
-            "get_shipment_summary", "shipment_specialist", order_id=claimed_order_id
+    if order_ev is None or items_ev is None:
+        trace.emit(
+            case_id=case_id,
+            event_type="policy_decided",
+            actor="policy-agent",
+            decision_code="insufficient_evidence",
         )
-        if isinstance(result, dict):
-            shipment_data = result
-            shipment_events = _as_rows(result.get("events", []))
+        policy_ev = await _fetch(
+            gateway, trace, case_id, "policy-agent", "get_policy", policy_version=policy_version
+        )
+        refs = [ev["evidence_ref"] for ev in (order_ev, policy_ev) if ev is not None]
+        trace.emit(case_id=case_id, event_type="handoff", actor="coordinator", target="verifier")
+        trace.emit(
+            case_id=case_id,
+            event_type="verification_completed",
+            actor="verifier",
+            decision_code="failed",
+            attributes={"problems": 1},
+        )
+        return _insufficient_evidence_output(case_id, order_id, refs, request["claims"])
 
     trace.emit(
-        case_id=case_id,
-        event_type="handoff",
-        actor="shipment_specialist",
-        target="policy_specialist",
+        case_id=case_id, event_type="task_assigned", actor="coordinator", target="payment-agent"
+    )
+    pay_timeline_ev = await _fetch(
+        gateway, trace, case_id, "payment-agent", "get_payment_timeline", order_id=order_id
     )
 
-    # -------------------------------------------------------------------------
-    # 5. POLICY SPECIALIST — verify the hypothesis, then apply the authoritative rule
-    # -------------------------------------------------------------------------
-    policy_data = await fetch("get_policy", "policy_specialist", policy_version=policy_version)
-    policy_rules: dict[str, Any] = {}
-    if isinstance(policy_data, dict) and isinstance(policy_data.get("rules"), dict):
-        policy_rules = policy_data["rules"]
-
-    # --- derive the facts the verification needs -----------------------------
-    order_status = str(order_data.get("order_status", "")).lower()
-    paid_total = round(sum(_as_float(row.get("payment_value")) for row in payments), 2)
-    items_total = round(sum(_as_float(row.get("price")) for row in items), 2)
-    freight_total = round(sum(_as_float(row.get("freight_value")) for row in items), 2)
-    order_total = round(items_total + freight_total, 2)
-    distinct_payment_count = len(
-        {
-            (row.get("payment_sequential"), row.get("payment_type"), row.get("payment_value"))
-            for row in payments
-        }
+    trace.emit(
+        case_id=case_id, event_type="task_assigned", actor="coordinator", target="shipment-agent"
+    )
+    shipment_ev = await _fetch(
+        gateway, trace, case_id, "shipment-agent", "get_shipment_summary", order_id=order_id
     )
 
-    captured_amounts = [
-        _as_float(event.get("amount_brl"))
-        for event in payment_events
-        if str(event.get("event_type", "")).lower() == "captured"
-    ]
-    has_duplicate_capture = len(captured_amounts) > len(set(captured_amounts))
-
-    refund_states = {str(event.get("event_type", "")).lower() for event in refund_events}
-    refund_states |= {str(event.get("status", "")).lower() for event in refund_events}
-
-    delivered_at = _parse_time(
-        shipment_data.get("delivered_customer_at") or order_data.get("order_delivered_customer_date")
+    refund_ev = await _fetch(
+        gateway, trace, case_id, "payment-agent", "get_refund_timeline", order_id=order_id
     )
-    estimated_at = _parse_time(
-        shipment_data.get("estimated_delivery_at")
-        or order_data.get("order_estimated_delivery_date")
+
+    result = _classify(
+        order_ev["data"],
+        items_ev["data"],
+        shipment_ev["data"],
+        pay_timeline_ev["data"],
+        refund_ev["data"] if refund_ev else None,
     )
-    delivered_late = bool(delivered_at and estimated_at and delivered_at > estimated_at)
-
-    # A `delivered_late` event alone proves nothing: these cases carry planted events
-    # whose event_at is months away from the real delivery. Lateness is only real when
-    # the order actually arrived after the estimate; the event then names who caused it.
-    late_actors: set[str] = set()
-    if delivered_late:
-        late_actors = {
-            str(event.get("actor", "")).lower()
-            for event in shipment_events
-            if "late" in str(event.get("event_type", "")).lower()
-        }
-        late_actors.discard("")
-
-    # --- verification: only override the claim when evidence contradicts it ---
-    data_conflicts: list[dict[str, Any]] = []
-    primary_issue = claimed_topic
-    overridden = False
-
-    def override(new_topic: str, field: str, source: str, code: str) -> None:
-        nonlocal primary_issue, overridden
-        if new_topic == primary_issue:
-            return
-        data_conflicts.append(
-            {
-                "field": field,
-                "sources": ["customer_request.claims", source],
-                "selected_source": source,
-                "resolution_code": code,
-            }
-        )
-        primary_issue = new_topic
-        overridden = True
-
-    if not order_data:
-        primary_issue = "insufficient_evidence"
-    elif claimed_topic in ("canceled_order_paid", "unavailable_order_paid"):
-        expected = "canceled" if claimed_topic == "canceled_order_paid" else "unavailable"
-        if order_status and order_status != expected:
-            if order_status in ("canceled", "cancelled"):
-                override(
-                    "canceled_order_paid",
-                    "assessment.primary_issue",
-                    "get_order.order_status",
-                    "PREFER_ORDER_STATUS_EVIDENCE",
-                )
-            elif order_status == "unavailable":
-                override(
-                    "unavailable_order_paid",
-                    "assessment.primary_issue",
-                    "get_order.order_status",
-                    "PREFER_ORDER_STATUS_EVIDENCE",
-                )
-            else:
-                override(
-                    "unsupported_claim",
-                    "assessment.primary_issue",
-                    "get_order.order_status",
-                    "CLAIM_CONTRADICTED_BY_ORDER_STATUS",
-                )
-    elif claimed_topic in ("late_delivery_seller", "late_delivery_logistics"):
-        if late_actors:
-            actual = (
-                "late_delivery_seller" if "seller" in late_actors else "late_delivery_logistics"
-            )
-            override(
-                actual,
-                "root_cause_analysis.responsible_parties",
-                "get_shipment_summary.events.actor",
-                "PREFER_SHIPMENT_EVENT_ACTOR",
-            )
-        elif not delivered_late and delivered_at is not None:
-            override(
-                "unsupported_claim",
-                "assessment.primary_issue",
-                "get_shipment_summary.delivered_customer_at",
-                "DELIVERY_WITHIN_ESTIMATE",
-            )
-    elif claimed_topic == "duplicate_charge":
-        if payment_events and not has_duplicate_capture:
-            override(
-                "unsupported_claim",
-                "assessment.primary_issue",
-                "get_payment_timeline.events",
-                "NO_DUPLICATE_CAPTURE_FOUND",
-            )
-    elif claimed_topic in ("refund_pending", "refund_failed"):
-        if refund_states:
-            if "failed" in refund_states:
-                override(
-                    "refund_failed",
-                    "assessment.primary_issue",
-                    "get_refund_timeline.events",
-                    "PREFER_REFUND_TIMELINE_STATE",
-                )
-            elif refund_states & {"pending", "processing", "requested", "initiated"}:
-                override(
-                    "refund_pending",
-                    "assessment.primary_issue",
-                    "get_refund_timeline.events",
-                    "PREFER_REFUND_TIMELINE_STATE",
-                )
-    elif claimed_topic == "valid_split_payment":
-        if payments and distinct_payment_count < 2:
-            override(
-                "unsupported_claim",
-                "assessment.primary_issue",
-                "get_order_payments",
-                "SINGLE_PAYMENT_NOT_A_SPLIT",
-            )
-    elif claimed_topic == "unsupported_claim":
-        if order_status in ("canceled", "cancelled") and paid_total > 0:
-            override(
-                "canceled_order_paid",
-                "assessment.primary_issue",
-                "get_order.order_status",
-                "EVIDENCE_SUPPORTS_STRONGER_ISSUE",
-            )
-        elif late_actors:
-            actual = (
-                "late_delivery_seller" if "seller" in late_actors else "late_delivery_logistics"
-            )
-            override(
-                actual,
-                "assessment.primary_issue",
-                "get_shipment_summary.events",
-                "EVIDENCE_SUPPORTS_STRONGER_ISSUE",
-            )
-
-    # --- apply the authoritative policy rule for the verified issue ----------
-    rule: dict[str, Any] = {}
-    if isinstance(policy_rules.get(primary_issue), dict):
-        rule = policy_rules[primary_issue]
-
-    if rule:
-        case_status = str(rule.get("case_status", "needs_investigation"))
-        refund_amount = round(_as_float(rule.get("refund_brl")), 2)
-        responsible_parties = [
-            {
-                "party_type": str(party.get("party_type", "unknown")),
-                "party_id": party.get("party_id"),
-            }
-            for party in _as_rows(rule.get("responsible_parties", []))
-            if party.get("party_type")
-        ]
-        resolution_actions = [str(rule["recommended_action"])] if rule.get("recommended_action") else []
-    else:
-        # No rule for this issue (e.g. insufficient_evidence): escalate, refund nothing.
-        case_status = "needs_investigation"
-        refund_amount = 0.0
-        responsible_parties = [{"party_type": "unknown", "party_id": None}]
-        resolution_actions = ["escalate_manual_review"]
-
-    if not responsible_parties:
-        responsible_parties = [{"party_type": "unknown", "party_id": None}]
-
-    # Name the real seller when the seller is the responsible party.
-    seller_ids = [
-        str(row["seller_id"])
-        for row in items + seller_rows
-        if row.get("seller_id")
-    ]
-    seller_ids = list(dict.fromkeys(seller_ids))
-    for party in responsible_parties:
-        if party["party_type"] == "seller" and not party["party_id"] and seller_ids:
-            party["party_id"] = seller_ids[0]
-
-    # Refund lines must sum exactly to the recommended refund.
-    refund_lines: list[dict[str, Any]] = []
-    if case_status == "action_required" and refund_amount > 0:
-        refund_lines.append(
-            {
-                "reason_code": REFUND_REASON_BY_TOPIC.get(primary_issue, "REFUND_POLICY_RULE"),
-                "amount_brl": refund_amount,
-                "entity_id": claimed_order_id,
-            }
-        )
-    else:
-        refund_amount = 0.0
-
-    ranked_causes = [
-        {
-            "cause_code": CAUSE_CODE_BY_TOPIC.get(primary_issue, "UNCLASSIFIED_ISSUE"),
-            "rank": 1,
-        }
-    ]
-
-    # --- calibrated confidence ----------------------------------------------
-    if primary_issue == "insufficient_evidence":
-        confidence = 0.3
-    elif not rule:
-        confidence = 0.5
-    elif overridden:
-        confidence = 0.8  # direct evidence, but it contradicts the customer
-    elif len(refs_by_tool) >= len(planned):
-        confidence = 0.93  # every planned domain confirmed the claim
-    else:
-        confidence = 0.75  # decision stands on partial evidence
+    primary_issue = result["primary_issue"]
 
     trace.emit(
         case_id=case_id,
         event_type="policy_decided",
-        actor="policy_specialist",
-        decision_code=f"RESOLVE_{primary_issue.upper()}"[:80],
-        evidence_refs=sorted(refs_by_tool.values()),
-        attributes={
-            "case_status": case_status,
-            "refund_brl": refund_amount,
-            "overridden_claim": overridden,
-        },
+        actor="policy-agent",
+        decision_code=primary_issue,
     )
-
-    # --- per-claim verdicts, each citing only the evidence it rests on -------
-    claim_refs: dict[str, list[str]] = {
-        "order": [refs_by_tool[t] for t in ("get_order", "get_order_items") if t in refs_by_tool],
-        "payment": [
-            refs_by_tool[t]
-            for t in ("get_order_payments", "get_payment_timeline", "get_refund_timeline")
-            if t in refs_by_tool
-        ],
-        "shipment": [
-            refs_by_tool[t]
-            for t in ("get_shipment_summary", "get_sellers")
-            if t in refs_by_tool
-        ],
+    policy_ev = await _fetch(
+        gateway, trace, case_id, "policy-agent", "get_policy", policy_version=policy_version
+    )
+    rule = (policy_ev["data"]["rules"].get(primary_issue) if policy_ev else None) or {
+        "case_status": "needs_investigation",
+        "recommended_action": "request_more_evidence",
+        "responsible_parties": [{"party_type": "unknown", "party_id": None}],
     }
+    case_status = rule["case_status"]
+    party_type = rule["responsible_parties"][0]["party_type"]
+    party_id = result["seller_id"] if party_type == "seller" else None
 
-    def refs_for(topic: str) -> list[str]:
-        if topic in ("late_delivery_seller", "late_delivery_logistics"):
-            groups = ["order", "shipment"]
-        elif topic in (
-            "valid_split_payment",
-            "payment_mismatch",
-            "duplicate_charge",
-            "refund_pending",
-            "refund_failed",
-        ):
-            groups = ["order", "payment"]
-        elif topic in ("canceled_order_paid", "unavailable_order_paid"):
-            groups = ["order", "payment"]
-        else:
-            groups = ["order", "payment", "shipment"]
-        picked: list[str] = []
-        for group in groups:
-            picked.extend(claim_refs.get(group, []))
-        policy_ref = refs_by_tool.get("get_policy")
-        if policy_ref:
-            picked.append(policy_ref)
-        return list(dict.fromkeys(picked))[:20]
-
-    claim_assessments: list[dict[str, Any]] = []
-    for claim in claims:
-        topic = claim.get("topic", "")
-        if primary_issue == "insufficient_evidence":
-            verdict = "insufficient_evidence"
-        elif topic == primary_issue:
-            verdict = "supported" if case_status != "no_action" else "unsupported"
-        elif topic == "requested_full_refund":
-            if refund_amount <= 0:
-                verdict = "unsupported"
-            elif order_total > 0 and refund_amount + 0.01 < order_total:
-                verdict = "partially_supported"
-            else:
-                verdict = "supported"
-        elif topic == "unsupported_claim":
-            verdict = "unsupported"
-        elif case_status == "action_required":
-            verdict = "partially_supported"
-        else:
-            verdict = "unsupported"
-
-        claim_assessments.append(
-            {
-                "claim_id": claim.get("claim_id", ""),
-                "verdict": verdict,
-                "confidence": round(confidence, 2),
-                "evidence_refs": refs_for(topic or primary_issue),
-            }
+    # ponytail: refs_by_tool + ISSUE_TOOLS keeps evidence_refs precise (only the tools
+    # that actually back this primary_issue), instead of citing every fetched domain.
+    refs_by_tool = {
+        tool_name: ev["evidence_ref"]
+        for tool_name, ev in (
+            ("get_order", order_ev),
+            ("get_order_items", items_ev),
+            ("get_payment_timeline", pay_timeline_ev),
+            ("get_shipment_summary", shipment_ev),
+            ("get_refund_timeline", refund_ev),
+            ("get_policy", policy_ev),
         )
+        if ev is not None
+    }
+    fetched_refs = set(refs_by_tool.values())
 
-    trace.emit(
-        case_id=case_id,
-        event_type="handoff",
-        actor="policy_specialist",
-        target="verifier",
-    )
+    def _refs_for(issue: str) -> list[str]:
+        return [refs_by_tool[t] for t in ISSUE_TOOLS[issue] if t in refs_by_tool]
 
-    # -------------------------------------------------------------------------
-    # 6. VERIFIER — cross-field invariants before the output leaves the agent
-    # -------------------------------------------------------------------------
-    payment_references = list(
-        dict.fromkeys(
-            f"{row.get('payment_type', 'payment')}-{row.get('payment_sequential', '0')}"
-            f"-{_as_float(row.get('payment_value')):.2f}"
-            for row in payments
-        )
-    )
-    item_ids = list(
-        dict.fromkeys(str(row["order_item_id"]) for row in items if row.get("order_item_id"))
-    )
-    shipment_id = shipment_data.get("shipment_id") or order_data.get("shipment_id")
+    evidence_refs = _refs_for(primary_issue)
+    refund_refs = [
+        refs_by_tool[t]
+        for t in ("get_payment_timeline", "get_refund_timeline", "get_policy")
+        if t in refs_by_tool
+    ]
 
-    line_total = round(sum(line["amount_brl"] for line in refund_lines), 2)
-    if line_total != refund_amount:
-        refund_amount = line_total
-    if case_status != "action_required" and refund_amount > 0:
-        refund_amount = 0.0
-        refund_lines = []
+    claim_assessments = [
+        {
+            "claim_id": claim["claim_id"],
+            "verdict": _claim_verdict(
+                claim["topic"], primary_issue, case_status, result["refund_brl"]
+            ),
+            "confidence": result["confidence"],
+            "evidence_refs": (
+                refund_refs if claim["topic"] == "requested_full_refund" else evidence_refs
+            ),
+        }
+        for claim in request["claims"]
+    ]
 
-    trace.emit(
-        case_id=case_id,
-        event_type="verification_completed",
-        actor="verifier",
-        target="coordinator",
-        decision_code="INVARIANTS_SATISFIED",
-        attributes={
-            "evidence_count": len(refs_by_tool),
-            "conflicts": len(data_conflicts),
-        },
-    )
-
-    return {
+    good_items = result["good_items"]
+    output = {
         "schema_version": "day09-l3a-output-v2",
         "case_id": case_id,
         "assessment": {
             "primary_issue": primary_issue,
             "case_status": case_status,
-            "confidence": round(confidence, 2),
+            "confidence": result["confidence"],
         },
         "affected_entities": {
-            "order_ids": [claimed_order_id] if claimed_order_id else [],
-            "item_ids": item_ids[:20],
-            "seller_ids": seller_ids[:20],
-            "payment_references": payment_references[:20],
-            "shipment_ids": [str(shipment_id)] if shipment_id else [],
+            "order_ids": [order_id],
+            "item_ids": sorted({i["order_item_id"] for i in good_items}),
+            "seller_ids": sorted({i["seller_id"] for i in good_items}),
+            # ponytail: no per-payment or per-shipment id field has been confirmed in a
+            # live evidence dump yet (MCP gateway unreachable), so these stay empty
+            # rather than invented (`pay-{order_id}-{i}` / `[order_id]` previously).
+            # Fill in once get_payment_timeline/get_shipment_summary dumps are read.
+            "payment_references": [],
+            "shipment_ids": [],
         },
-        "claim_assessments": claim_assessments[:5],
+        "claim_assessments": claim_assessments,
         "root_cause_analysis": {
-            "ranked_causes": ranked_causes[:5],
-            "responsible_parties": responsible_parties[:5],
+            "ranked_causes": [{"cause_code": primary_issue.upper(), "rank": 1}],
+            "responsible_parties": [{"party_type": party_type, "party_id": party_id}],
         },
-        "evidence_refs": sorted(refs_by_tool.values())[:30],
-        "data_conflicts": data_conflicts[:5],
+        "evidence_refs": evidence_refs,
+        "data_conflicts": result["conflicts"],
         "financial_resolution": {
             "currency": "BRL",
-            "recommended_refund_brl": refund_amount,
-            "refund_lines": refund_lines[:10],
+            "recommended_refund_brl": result["refund_brl"],
+            "refund_lines": (
+                [
+                    {
+                        "reason_code": primary_issue,
+                        "amount_brl": result["refund_brl"],
+                        "entity_id": order_id,
+                    }
+                ]
+                if result["refund_brl"] > 0
+                else []
+            ),
         },
-        "resolution_actions": list(dict.fromkeys(resolution_actions))[:8],
+        "resolution_actions": [rule["recommended_action"]],
+    }
+
+    trace.emit(case_id=case_id, event_type="handoff", actor="coordinator", target="verifier")
+    problems = _verify(output, fetched_refs)
+    if problems:
+        output["assessment"]["primary_issue"] = "insufficient_evidence"
+        output["assessment"]["case_status"] = "needs_investigation"
+        output["assessment"]["confidence"] = 0.3
+        output["evidence_refs"] = _refs_for("insufficient_evidence")
+        output["root_cause_analysis"] = {
+            "ranked_causes": [{"cause_code": "INSUFFICIENT_EVIDENCE", "rank": 1}],
+            "responsible_parties": [{"party_type": "unknown", "party_id": None}],
+        }
+        output["financial_resolution"]["recommended_refund_brl"] = 0.0
+        output["financial_resolution"]["refund_lines"] = []
+        output["resolution_actions"] = ["request_more_evidence"]
+        for claim in output["claim_assessments"]:
+            claim["verdict"] = "insufficient_evidence"
+            claim["confidence"] = 0.3
+            claim["evidence_refs"] = output["evidence_refs"]
+    trace.emit(
+        case_id=case_id,
+        event_type="verification_completed",
+        actor="verifier",
+        decision_code="failed" if problems else "passed",
+        attributes={"problems": len(problems)},
+    )
+    return output
+
+
+def _insufficient_evidence_output(
+    case_id: str, order_id: str, refs: list[str], claims: list[dict[str, Any]]
+) -> dict[str, Any]:
+    return {
+        "schema_version": "day09-l3a-output-v2",
+        "case_id": case_id,
+        "assessment": {
+            "primary_issue": "insufficient_evidence",
+            "case_status": "needs_investigation",
+            "confidence": 0.3,
+        },
+        "affected_entities": {
+            "order_ids": [order_id],
+            "item_ids": [],
+            "seller_ids": [],
+            "payment_references": [],
+            "shipment_ids": [],
+        },
+        "claim_assessments": [
+            {
+                "claim_id": claim["claim_id"],
+                "verdict": "insufficient_evidence",
+                "confidence": 0.3,
+                "evidence_refs": refs,
+            }
+            for claim in claims
+        ],
+        "root_cause_analysis": {
+            "ranked_causes": [{"cause_code": "INSUFFICIENT_EVIDENCE", "rank": 1}],
+            "responsible_parties": [{"party_type": "unknown", "party_id": None}],
+        },
+        "evidence_refs": refs,
+        "data_conflicts": [],
+        "financial_resolution": {
+            "currency": "BRL",
+            "recommended_refund_brl": 0.0,
+            "refund_lines": [],
+        },
+        "resolution_actions": ["request_more_evidence"],
     }

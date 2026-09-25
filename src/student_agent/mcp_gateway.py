@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -8,6 +9,7 @@ from typing import Any
 import httpx2
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from mcp.shared.exceptions import MCPError
 
 from .contracts import Contracts
 
@@ -23,18 +25,22 @@ class EvidenceGateway:
 
     async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
-        result = await self._session.call_tool(tool_name, arguments=payload)
-        is_error = getattr(result, "is_error", None)
-        if is_error is None:
-            is_error = getattr(result, "isError", False)
-        if is_error:
+        # ponytail: fixed 3 attempts with linear backoff for transient gateway errors;
+        # tool-level errors (result.is_error) are real answers and are not retried.
+        for attempt in range(3):
+            try:
+                result = await self._session.call_tool(tool_name, arguments=payload)
+                break
+            except (MCPError, httpx2.HTTPError):
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(2 * (attempt + 1))
+        if result.is_error:
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
             raise RuntimeError(f"MCP tool {tool_name} failed: {message or 'unknown error'}")
-        evidence = getattr(result, "structuredContent", None)
-        if evidence is None:
-            evidence = getattr(result, "structured_content", None)
+        evidence = result.structured_content
         if evidence is None:
             text_blocks = [block.text for block in result.content if getattr(block, "text", None)]
             if len(text_blocks) != 1:
