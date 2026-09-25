@@ -187,12 +187,15 @@ class VerifierAgent:
         if not entities["order_ids"] and claimed and state.refs_for_domain("order"):
             entities["order_ids"] = [claimed]
             report.fixes.append("order_id_from_evidence")
+        # Only a seller that evidence ties to this case may be added; the shared policy's
+        # example seller must never leak into the output.
         sellers = entities["seller_ids"]
+        case_sellers = state.case_seller_ids()
         for party in decision.responsible_parties:
             seller_id = party["party_id"]
             if (
                 party["party_type"] == "seller"
-                and seller_id
+                and seller_id in case_sellers
                 and seller_id not in sellers
                 and len(sellers) < 20
             ):
@@ -445,8 +448,15 @@ class VerifierAgent:
                 dict(party) for party in decision.responsible_parties
             ]
         sellers = entities["seller_ids"]
+        checked: list[dict[str, Any]] = []
         for party in parties:
-            if party["party_type"] == "seller" and not party["party_id"] and len(sellers) == 1:
-                party["party_id"] = sellers[0]
-                report.fixes.append("seller_party_id_filled")
-        return {"ranked_causes": causes, "responsible_parties": parties}
+            if party["party_type"] == "seller":
+                if party["party_id"] and party["party_id"] not in sellers:
+                    party["party_id"] = None
+                    report.fixes.append("unverified_seller_cleared")
+                if not party["party_id"] and len(sellers) == 1:
+                    party["party_id"] = sellers[0]
+                    report.fixes.append("seller_party_id_filled")
+            if party not in checked:
+                checked.append(party)
+        return {"ranked_causes": causes, "responsible_parties": checked}

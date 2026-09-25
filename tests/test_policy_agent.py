@@ -6,7 +6,7 @@ from decimal import Decimal
 import pytest
 
 from conftest import FakeGateway, make_state, read_trace
-from student_agent.agents import PolicyAgent
+from student_agent.agents import CaseState, PolicyAgent
 from student_agent.agents.policy_agent import to_money
 from student_agent.trace import TraceWriter
 
@@ -118,3 +118,80 @@ def test_no_action_rule_never_refunds() -> None:
 )
 def test_to_money_rounds_to_cents(raw: object, expected: Decimal | None) -> None:
     assert to_money(raw) == expected
+
+
+EXAMPLE_SELLER = "seller-e58fb7bfd033"  # example id inside the shared policy
+
+
+def seller_rule_state(**fields: object) -> CaseState:
+    state = make_state()
+    state.policy_data = {
+        "rules": {
+            "late_delivery_seller": {
+                "case_status": "action_required",
+                "recommended_action": "refund_freight",
+                "refund_brl": 18.0,
+                "responsible_parties": [
+                    {"party_type": "seller", "party_id": EXAMPLE_SELLER},
+                    {"party_type": "platform", "party_id": None},
+                ],
+            }
+        }
+    }
+    for name, value in fields.items():
+        setattr(state, name, value)
+    return state
+
+
+def test_shared_policy_seller_is_replaced_by_case_sellers() -> None:
+    state = seller_rule_state(seller_ids=["seller-aaa", "seller-bbb", "seller-aaa"])
+
+    decision = PolicyAgent().lookup(state, "late_delivery_seller")
+
+    assert decision.responsible_parties == (
+        {"party_type": "seller", "party_id": "seller-aaa"},
+        {"party_type": "seller", "party_id": "seller-bbb"},
+        {"party_type": "platform", "party_id": None},
+    )
+
+
+def test_shared_policy_seller_becomes_unknown_without_case_evidence() -> None:
+    decision = PolicyAgent().lookup(seller_rule_state(), "late_delivery_seller")
+
+    assert decision.responsible_parties[0] == {"party_type": "seller", "party_id": None}
+    assert EXAMPLE_SELLER not in str(decision)
+
+
+def test_case_sellers_come_from_in_window_shipping_limits_only() -> None:
+    state = seller_rule_state(
+        order_data={"order_purchase_timestamp": "2017-12-20T09:00:00-03:00"},
+        shipment_data={
+            "shipping_limits": [
+                {"seller_id": "seller-real", "shipping_limit_at": "2017-12-23T09:00:00-03:00"},
+                # Noise: deadline after the case was opened (2018-01-01).
+                {"seller_id": "seller-noise", "shipping_limit_at": "2018-05-14T09:00:00-03:00"},
+                # Noise: deadline before the purchase minus one day of slack.
+                {"seller_id": "seller-old-noise", "shipping_limit_at": "2017-12-01T09:00:00-03:00"},
+                {"seller_id": "", "shipping_limit_at": "2017-12-23T09:00:00-03:00"},
+                "not-a-row",
+            ]
+        },
+    )
+
+    assert state.case_seller_ids() == ["seller-real"]
+    assert PolicyAgent().lookup(state, "late_delivery_seller").responsible_parties[0] == {
+        "party_type": "seller", "party_id": "seller-real"
+    }
+
+
+def test_explicit_case_sellers_take_precedence_over_shipment_data() -> None:
+    state = seller_rule_state(
+        seller_ids=["seller-from-coordinator"],
+        shipment_data={
+            "shipping_limits": [
+                {"seller_id": "seller-other", "shipping_limit_at": "2017-12-23T09:00:00-03:00"}
+            ]
+        },
+    )
+
+    assert state.case_seller_ids() == ["seller-from-coordinator"]

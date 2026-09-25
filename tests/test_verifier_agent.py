@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from typing import Any
 
@@ -16,6 +17,8 @@ from student_agent.agents.verifier_agent import (
 from student_agent.trace import TraceWriter
 
 ORDER_ID = "e2a03ccf5ea816036608b2d8c3ab8e60"
+EXAMPLE_SELLER = "seller-e58fb7bfd033"  # example id inside the shared policy, not this case's
+CASE_SELLER = "seller-0a1b2c3d4e5f"
 
 
 def collect(
@@ -177,20 +180,99 @@ def test_no_action_case_has_zero_refund_and_records_claim_conflict(
     ]
 
 
-def test_seller_fault_names_the_seller_in_entities_and_parties(
+def test_seller_fault_names_the_case_seller_not_the_policy_example(
     gateway: FakeGateway, trace: TraceWriter
 ) -> None:
     state = make_state()
+    state.seller_ids = [CASE_SELLER]
     refs = collect(state, gateway, trace, "get_order", "get_shipment_summary")
 
     output = VerifierAgent().verify(
         state, draft(state.case_id, "late_delivery_seller", [refs["get_shipment_summary"]]), trace
     )
 
-    seller = {"party_type": "seller", "party_id": "seller-e58fb7bfd033"}
-    assert output["root_cause_analysis"]["responsible_parties"] == [seller]
-    assert "seller-e58fb7bfd033" in output["affected_entities"]["seller_ids"]
+    assert output["root_cause_analysis"]["responsible_parties"] == [
+        {"party_type": "seller", "party_id": CASE_SELLER}
+    ]
+    assert output["affected_entities"]["seller_ids"] == [CASE_SELLER]
+    assert EXAMPLE_SELLER not in json.dumps(output)
     assert output["financial_resolution"]["recommended_refund_brl"] == 18.0
+
+
+def test_example_seller_never_leaks_when_verifier_decides_itself(
+    gateway: FakeGateway, trace: TraceWriter
+) -> None:
+    state = make_state()  # no seller evidence for this case at all
+    refs = collect(state, gateway, trace, "get_order", "get_shipment_summary")
+    assert state.policy_decision is None  # verify() must call decide() on its own
+
+    output = VerifierAgent().verify(
+        state, draft(state.case_id, "late_delivery_seller", [refs["get_shipment_summary"]]), trace
+    )
+
+    assert output["root_cause_analysis"]["responsible_parties"] == [
+        {"party_type": "seller", "party_id": None}
+    ]
+    assert output["affected_entities"]["seller_ids"] == []
+    assert EXAMPLE_SELLER not in json.dumps(output)
+
+
+def test_unlocalized_policy_decision_from_caller_is_cleaned(
+    gateway: FakeGateway, trace: TraceWriter
+) -> None:
+    state = make_state()
+    refs = collect(state, gateway, trace, "get_order", "get_shipment_summary")
+    # A caller that skipped localization hands over the raw shared-policy rule.
+    state.policy_decision = dataclasses.replace(
+        PolicyAgent().lookup(state, "late_delivery_seller"),
+        responsible_parties=({"party_type": "seller", "party_id": EXAMPLE_SELLER},),
+    )
+    base = draft(state.case_id, "late_delivery_seller", [refs["get_shipment_summary"]])
+    base["affected_entities"]["seller_ids"] = [CASE_SELLER]
+
+    output = VerifierAgent().verify(state, base, trace)
+
+    assert output["root_cause_analysis"]["responsible_parties"] == [
+        {"party_type": "seller", "party_id": CASE_SELLER}
+    ]
+    assert output["affected_entities"]["seller_ids"] == [CASE_SELLER]
+    assert EXAMPLE_SELLER not in json.dumps(output)
+    assert "unverified_seller_cleared" in read_trace(trace)[-1]["attributes"]["fixes"]
+
+
+def test_refs_outside_case_state_are_dropped_everywhere(
+    gateway: FakeGateway, trace: TraceWriter
+) -> None:
+    state = make_state(topics=("canceled_order_paid",))
+    collect(state, gateway, trace, "get_order", "get_order_payments")
+    # Well-formed refs that were never recorded in this CaseState.
+    outside = ["ev_never_seen_in_this_case_0001", "ev_never_seen_in_this_case_0002"]
+
+    output = VerifierAgent().verify(
+        state,
+        draft(
+            state.case_id,
+            "canceled_order_paid",
+            outside,
+            claim_assessments=[
+                {"claim_id": "claim-001-a", "verdict": "supported", "confidence": 0.9,
+                 "evidence_refs": outside},
+            ],
+        ),
+        trace,
+    )
+
+    cited = set(output["evidence_refs"])
+    for claim in output["claim_assessments"]:
+        cited |= set(claim["evidence_refs"])
+    assert cited and cited <= set(state.evidence)
+    assert not cited & set(outside)
+    # Required order + payment + policy evidence is re-added from the case's own records.
+    assert {state.evidence[ref].domain for ref in output["evidence_refs"]} == {
+        "order", "payment", "policy"
+    }
+    assert output["claim_assessments"][0]["verdict"] == "insufficient_evidence"
+    assert read_trace(trace)[-1]["attributes"]["dropped_refs"] == 2
 
 
 def test_valid_specialist_refund_lines_are_kept_and_invalid_ones_rebuilt(

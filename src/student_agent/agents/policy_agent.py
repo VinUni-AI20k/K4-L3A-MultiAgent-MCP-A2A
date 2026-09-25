@@ -41,6 +41,24 @@ def clean_parties(raw: Any) -> tuple[dict[str, str | None], ...]:
     return tuple(parties[:5])
 
 
+def localize_parties(
+    parties: tuple[dict[str, str | None], ...], case_sellers: list[str]
+) -> tuple[dict[str, str | None], ...]:
+    """The policy is shared by every case, so its seller party_id is only an example.
+
+    Replace each seller party with the case's real sellers, or party_id None when unknown.
+    """
+    localized: list[dict[str, str | None]] = []
+    for party in parties:
+        if party["party_type"] == "seller":
+            ids: list[str | None] = list(case_sellers) or [None]
+            candidates = [{"party_type": "seller", "party_id": seller} for seller in ids]
+        else:
+            candidates = [dict(party)]
+        localized += [c for c in candidates if c not in localized]
+    return tuple(localized[:5])
+
+
 @dataclass(frozen=True)
 class PolicyDecision:
     primary_issue: str
@@ -94,7 +112,9 @@ class PolicyAgent:
                     case_status=status,
                     recommended_action=action.strip(),
                     refund_brl=Decimal(0) if status == "no_action" else refund,
-                    responsible_parties=clean_parties(rule.get("responsible_parties")),
+                    responsible_parties=localize_parties(
+                        clean_parties(rule.get("responsible_parties")), state.case_seller_ids()
+                    ),
                     evidence_ref=policy_refs[0] if policy_refs else None,
                 )
         action = (

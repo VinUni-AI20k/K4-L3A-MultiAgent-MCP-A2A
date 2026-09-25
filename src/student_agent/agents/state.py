@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..mcp_gateway import EvidenceGateway
 from ..trace import TraceWriter
+from .evidence_rules import WINDOW_SLACK, parse_ts
 
 if TYPE_CHECKING:
     from .policy_agent import PolicyDecision
@@ -41,6 +42,8 @@ class CaseState:
     shipment_data: dict[str, Any] | None = None
     payment_data: dict[str, Any] | None = None
     policy_data: dict[str, Any] | None = None
+    # Real sellers of this case, taken from in-window item/shipment evidence.
+    seller_ids: list[str] = field(default_factory=list)
 
     claims_assessed: list[dict[str, Any]] = field(default_factory=list)
     conflicts_detected: list[dict[str, Any]] = field(default_factory=list)
@@ -65,6 +68,35 @@ class CaseState:
     def claims(self) -> list[dict[str, Any]]:
         claims = self.customer_request.get("claims") or []
         return [claim for claim in claims if isinstance(claim, dict) and claim.get("claim_id")]
+
+    def case_seller_ids(self) -> list[str]:
+        """Sellers that evidence ties to this case; never the example seller from the policy.
+
+        Uses ``seller_ids`` when a caller set it, otherwise the ``shipping_limits`` rows of
+        ``shipment_data`` inside ``[order_purchase_timestamp - 1 day, opened_at]``.
+        """
+        explicit = [s for s in self.seller_ids if isinstance(s, str) and s]
+        if explicit:
+            return list(dict.fromkeys(explicit))
+        limits = (self.shipment_data or {}).get("shipping_limits")
+        end = parse_ts(self.opened_at)
+        purchase = parse_ts((self.order_data or {}).get("order_purchase_timestamp"))
+        start = purchase - WINDOW_SLACK if purchase else None
+        sellers: list[str] = []
+        for row in limits if isinstance(limits, list) else []:
+            if not isinstance(row, dict):
+                continue
+            seller = row.get("seller_id")
+            deadline = parse_ts(row.get("shipping_limit_at"))
+            in_window = (
+                deadline is not None
+                and end is not None
+                and deadline <= end
+                and (start is None or deadline >= start)
+            )
+            if isinstance(seller, str) and seller and in_window and seller not in sellers:
+                sellers.append(seller)
+        return sellers
 
     async def fetch(
         self,
