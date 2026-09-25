@@ -52,25 +52,33 @@ day09 --help
 COMPETITION_API_URL=http://127.0.0.1:8081
 COMPETITION_TEAM_API_KEY=sk-team-your_key
 MCP_ENDPOINT=http://127.0.0.1:8001/mcp
+OPENROUTER_API_KEY=sk-or-v1-your_key
+OPENROUTER_MODEL=qwen/qwen3-8b
 ```
+
+Workflow dùng Qwen3 8B làm verifier và từ chối model không nằm trong allowlist dưới
+10B tham số. Không commit `.env` hoặc gửi API key vào output/trace.
 
 ## 3. Tải input
 
-Tải ZIP input **L3A** từ GitHub Release và giải nén vào root repo:
+Đăng nhập workspace `/l3a` bằng Team API Key, để hệ thống tạo scoped run, rồi tải ZIP
+input **L3A của run hiện tại** và giải nén vào root repo. Bundle do workspace cấp là
+nguồn chuẩn về `case_set_version`, danh sách case và cấu hình MCP.
 
 ```bash
 unzip l3a-inputs-<version>.zip -d .
 day09 validate-inputs
 ```
 
-Cấu trúc đúng:
+Cấu trúc đúng (số file phải khớp chính xác `case-set.json`; workspace hiện tại có thể
+yêu cầu 50 output dù starter/release cũ có 100 case):
 
 ```text
 case-set.json
 inputs/
 ├── L3A_CASE_001.json
 ├── ...
-└── L3A_CASE_100.json
+└── ...
 ```
 
 ## 4. Sử dụng MCP
@@ -158,7 +166,7 @@ outputs/<case_id>.json
 traces/trace.jsonl
 ```
 
-Nếu output pass schema nhưng điểm thấp, cần kiểm tra lại semantic, evidence, consistency, confidence và workflow — schema chỉ là một phần nhỏ của điểm.
+Nếu output pass schema nhưng điểm thấp, cần kiểm tra lại semantic, evidence, consistency, confidence và workflow — schema chỉ là một phần nhỏ của điểm. Validator local chỉ xác nhận bundle đang có; trước khi upload phải đối chiếu số output với quy tắc hiển thị trên workspace của scoped run.
 
 ## 7. Đóng gói và nộp bài
 

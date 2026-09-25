@@ -29,7 +29,7 @@ def _object(path: Path) -> dict[str, Any]:
     return value
 
 
-def load_case_set(root: Path, expected_count: int = 100) -> CaseSet:
+def load_case_set(root: Path, expected_count: int | None = None) -> CaseSet:
     root = root.resolve()
     manifest = _object(root / "case-set.json")
     if set(manifest) != {"case_set_version", "variant_id", "case_ids"}:
@@ -39,7 +39,9 @@ def load_case_set(root: Path, expected_count: int = 100) -> CaseSet:
     raw_ids = manifest["case_ids"]
     if not isinstance(raw_ids, list) or not all(isinstance(item, str) for item in raw_ids):
         raise ValueError("case_ids must be an array of strings")
-    if len(raw_ids) != expected_count or len(set(raw_ids)) != expected_count:
+    if not raw_ids or len(set(raw_ids)) != len(raw_ids):
+        raise ValueError("case-set must contain a non-empty list of unique case IDs")
+    if expected_count is not None and len(raw_ids) != expected_count:
         raise ValueError(f"case-set must contain exactly {expected_count} unique case IDs")
     if any(not CASE_ID_PATTERN.fullmatch(case_id) for case_id in raw_ids):
         raise ValueError("case-set contains an invalid case ID")
