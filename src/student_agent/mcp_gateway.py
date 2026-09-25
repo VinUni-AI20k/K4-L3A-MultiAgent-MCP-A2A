@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -21,14 +22,42 @@ class EvidenceGateway:
         response = await self._session.list_tools()
         return sorted(tool.name for tool in response.tools)
 
-    async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+    async def call(
+        self,
+        tool_name: str,
+        *,
+        case_id: str,
+        allow_error: bool = False,
+        **arguments: str,
+    ) -> dict[str, Any] | None:
         payload = {"case_id": case_id, **arguments}
-        result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        max_retries = 3
+        result = None
+        for attempt in range(max_retries):
+            try:
+                result = await self._session.call_tool(tool_name, arguments=payload)
+                break
+            except Exception:
+                if attempt == max_retries - 1:
+                    if allow_error:
+                        return None
+                    raise
+                await asyncio.sleep(0.5 * (2**attempt))
+
+        if result is None:
+            if allow_error:
+                return None
+            raise RuntimeError(f"MCP tool {tool_name} returned no result")
+
+        is_error = getattr(result, "is_error", getattr(result, "isError", False))
+        if is_error:
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
+            if allow_error:
+                return None
             raise RuntimeError(f"MCP tool {tool_name} failed: {message or 'unknown error'}")
+
         evidence = getattr(result, "structuredContent", None)
         if evidence is None:
             evidence = getattr(result, "structured_content", None)
