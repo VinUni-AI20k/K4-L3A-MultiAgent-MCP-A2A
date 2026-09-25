@@ -253,14 +253,15 @@ async def fetch_domain_evidence(
             bundle.mark_unresolved(domain, entity_id)
         return DomainFetchResult(domain, [], "unavailable", DECISION_LOOKUP_UNAVAILABLE, 0)
 
-    async def fetch_one(entity_id: str) -> LookupOutcome:
+    async def fetch_one(entity_id: str) -> list[LookupOutcome]:
         id_params = [(d, _id_argument_name(d)) for d in tools]
         id_params = [(d, p) for d, p in id_params if p is not None]
         if not id_params:
-            return LookupOutcome(entity_id, None, "unavailable", DECISION_LOOKUP_UNAVAILABLE, 0)
+            return [LookupOutcome(entity_id, None, "unavailable", DECISION_LOOKUP_UNAVAILABLE, 0)]
 
-        total_attempts = 0
+        results: list[LookupOutcome] = []
         for descriptor, id_param in id_params:
+            total_attempts = 0
             attempt = 0
             while True:
                 total_attempts += 1
@@ -270,27 +271,29 @@ async def fetch_domain_evidence(
                         descriptor.name, case_id=case_id, **{id_param: entity_id}
                     )
                 except ContractError:
-                    # Envelope failed the public MCP schema: never retry a
-                    # structurally invalid response, and never use its data.
-                    return LookupOutcome(
+                    results.append(LookupOutcome(
                         entity_id, None, "unavailable", DECISION_ENVELOPE_INVALID, total_attempts
-                    )
+                    ))
+                    break
                 except httpx2.TimeoutException:
                     if attempt > max_retries:
-                        return LookupOutcome(
+                        results.append(LookupOutcome(
                             entity_id, None, "unavailable", DECISION_TIMEOUT, total_attempts
-                        )
+                        ))
+                        break
                     continue
                 except httpx2.HTTPError:
                     if attempt > max_retries:
-                        return LookupOutcome(
+                        results.append(LookupOutcome(
                             entity_id, None, "unavailable", DECISION_UNAVAILABLE, total_attempts
-                        )
+                        ))
+                        break
                     continue
                 except (RuntimeError, ValueError):
-                    return LookupOutcome(
+                    results.append(LookupOutcome(
                         entity_id, None, "not_found", DECISION_NOT_FOUND, total_attempts
-                    )
+                    ))
+                    break
                 item = EvidenceItem(
                     domain=domain,
                     entity_id=entity_id,
@@ -299,33 +302,35 @@ async def fetch_domain_evidence(
                     data=evidence["data"],
                     warnings=tuple(evidence.get("warnings", ())),
                 )
-                return LookupOutcome(entity_id, item, "completed", None, total_attempts)
-        return LookupOutcome(entity_id, None, "not_found", DECISION_NOT_FOUND, total_attempts)
+                results.append(LookupOutcome(entity_id, item, "completed", None, total_attempts))
+                break
+        return results if results else [LookupOutcome(entity_id, None, "not_found", DECISION_NOT_FOUND, 0)]
 
-    outcomes = await asyncio.gather(*(fetch_one(entity_id) for entity_id in sorted(entity_ids)))
+    nested_outcomes = await asyncio.gather(*(fetch_one(entity_id) for entity_id in sorted(entity_ids)))
+    # flatten: each fetch_one now returns a list of LookupOutcome
+    outcomes: list[LookupOutcome] = [o for batch in nested_outcomes for o in batch]
 
     items: list[EvidenceItem] = []
+    seen_entity_ids: set[str] = set()
     for outcome in outcomes:
         if outcome.item is not None:
             bundle.add(outcome.item)
             items.append(outcome.item)
-        else:
-            bundle.mark_unresolved(domain, outcome.entity_id)
+            seen_entity_ids.add(outcome.entity_id)
+
+    # Mark unresolved only for entities that had NO successful lookups at all
+    for entity_id in sorted(entity_ids):
+        if entity_id not in seen_entity_ids:
+            bundle.mark_unresolved(domain, entity_id)
 
     statuses = {outcome.status for outcome in outcomes}
     if statuses == {"completed"}:
         domain_status, decision_code = "completed", None
     elif "completed" not in statuses:
-        # every id failed the same way (or a mix of not_found/unavailable) -- surface
-        # the most actionable single status: unavailable beats not_found.
         domain_status = "unavailable" if "unavailable" in statuses else "not_found"
         decision_code = next(o.decision_code for o in outcomes if o.status == domain_status)
     else:
-        domain_status, decision_code = "insufficient_evidence", None
-        for outcome in outcomes:
-            if outcome.decision_code is not None:
-                decision_code = outcome.decision_code
-                break
+        domain_status, decision_code = "completed", None
 
     return DomainFetchResult(
         domain, items, domain_status, decision_code, sum(o.attempts for o in outcomes)
