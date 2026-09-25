@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 class PaymentResolutionAgent:
-    """Agent phụ trách điều tra Tài chính, Đối soát và Hoàn tiền (Thành viên 3)."""
+    """Agent phụ trách điều tra Tài chính, Đối soát và Hoàn tiền (Nguyễn Đức Phát)."""
 
     def __init__(self, actor_name: str = "payment-resolution-agent") -> None:
         self.actor_name = actor_name
@@ -72,41 +72,42 @@ class PaymentResolutionAgent:
 
         # 2. Gọi MCP get_payment_timeline (kiểm tra duplicate charge)
         captured_events: list[dict[str, Any]] = []
+        timeline_ev_ref = None
         try:
             timeline_ev = await gateway.call("get_payment_timeline", case_id=case_id, order_id=order_id)
-            ev_ref = timeline_ev.get("evidence_ref")
-            if ev_ref:
-                result.evidence_refs.append(ev_ref)
+            timeline_ev_ref = timeline_ev.get("evidence_ref")
+            if timeline_ev_ref:
+                result.evidence_refs.append(timeline_ev_ref)
                 trace.emit(
                     case_id=case_id,
                     event_type="tool_result_consumed",
                     actor=self.actor_name,
                     tool_name="get_payment_timeline",
-                    evidence_refs=[ev_ref],
+                    evidence_refs=[timeline_ev_ref],
                 )
             t_data = timeline_ev.get("data", {})
             captured_events = [
                 e for e in t_data.get("events", []) if e.get("event_type") == "captured"
             ]
             t_payments = t_data.get("payments", [])
-            # Nếu có 4 payments hoặc captured events gấp đôi số sequential thì là duplicate charge
             if len(captured_events) >= 4 or (len(t_payments) > len(payments) and len(t_payments) >= 4):
                 result.is_duplicate_charge = True
         except Exception as exc:
             logger.info(f"[{case_id}] get_payment_timeline error or not available: {exc}")
 
         # 3. Gọi MCP get_refund_timeline (kiểm tra refund pending / refund failed)
+        refund_ev_ref = None
         try:
             refund_ev = await gateway.call("get_refund_timeline", case_id=case_id, order_id=order_id)
-            ev_ref = refund_ev.get("evidence_ref")
-            if ev_ref:
-                result.evidence_refs.append(ev_ref)
+            refund_ev_ref = refund_ev.get("evidence_ref")
+            if refund_ev_ref:
+                result.evidence_refs.append(refund_ev_ref)
                 trace.emit(
                     case_id=case_id,
                     event_type="tool_result_consumed",
                     actor=self.actor_name,
                     tool_name="get_refund_timeline",
-                    evidence_refs=[ev_ref],
+                    evidence_refs=[refund_ev_ref],
                 )
             ref_data = refund_ev.get("data", {})
             for r_event in ref_data.get("events", []):
@@ -121,10 +122,9 @@ class PaymentResolutionAgent:
         order_status = order_ctx.order_status
         expected_total = order_ctx.order_total_brl or float(order_ctx.order_data.get("order_total_value", 0.0))
 
-        # Ưu tiên các lỗi phát hiện được:
         if result.refund_status == "pending":
             result.suggested_issue = "refund_pending"
-            result.recommended_refund_brl = 0.0  # refund đang xử lý, không giải ngân trùng
+            result.recommended_refund_brl = 0.0
             result.resolution_actions.append("expedite_pending_refund")
 
         elif result.refund_status == "failed":
@@ -141,7 +141,6 @@ class PaymentResolutionAgent:
 
         elif result.is_duplicate_charge:
             result.suggested_issue = "duplicate_charge"
-            # Hoàn lại nửa số tiền bị trừ trùng
             dup_amount = round(result.total_paid_brl / 2.0, 2) if result.total_paid_brl > 0 else 0.0
             result.recommended_refund_brl = dup_amount
             result.refund_lines.append(
@@ -195,34 +194,51 @@ class PaymentResolutionAgent:
         elif result.is_split_payment:
             result.suggested_issue = "valid_split_payment"
 
-        # 5. Đánh giá từng Claim của khách hàng
+        # 5. Đánh giá từng Claim của khách hàng và gắn ĐÚNG evidence tương ứng
         for cl in claims:
             claim_id = cl.get("claim_id", "")
             topic = cl.get("topic", "")
 
-            # Phán quyết dựa trên bằng chứng
-            if topic in ["canceled_order_paid", "unavailable_order_paid"]:
+            # Chọn evidence gắn chặt với domain của claim
+            if topic in ["late_delivery_seller", "late_delivery_logistics"]:
+                claim_ev_refs = list(order_ctx.evidence_refs)
+                verdict = "supported" if order_ctx.suggested_issue == topic else "unsupported"
+                conf = 0.95
+            elif topic in ["refund_pending", "refund_failed"]:
+                claim_ev_refs = [refund_ev_ref] if refund_ev_ref else list(result.evidence_refs)
+                verdict = "supported" if result.suggested_issue == topic else "unsupported"
+                conf = 0.95
+            elif topic == "duplicate_charge":
+                claim_ev_refs = [timeline_ev_ref] if timeline_ev_ref else list(result.evidence_refs)
+                verdict = "supported" if result.is_duplicate_charge else "unsupported"
+                conf = 0.95
+            elif topic in ["canceled_order_paid", "unavailable_order_paid"]:
+                claim_ev_refs = list(order_ctx.evidence_refs) + list(result.evidence_refs)
                 verdict = "supported" if order_status in ["canceled", "unavailable"] else "unsupported"
                 conf = 0.95
             elif topic == "requested_full_refund":
+                claim_ev_refs = list(result.evidence_refs)
                 verdict = "supported" if result.recommended_refund_brl > 0 else "unsupported"
                 conf = 0.90
-            elif topic in ["late_delivery_seller", "late_delivery_logistics"]:
-                verdict = "supported" if order_ctx.suggested_issue == topic else "unsupported"
+            elif topic == "valid_split_payment":
+                claim_ev_refs = list(result.evidence_refs)
+                verdict = "supported" if result.is_split_payment else "unsupported"
                 conf = 0.95
-            elif topic in ["refund_pending", "refund_failed", "duplicate_charge", "payment_mismatch", "valid_split_payment"]:
-                verdict = "supported" if result.suggested_issue == topic else "unsupported"
+            elif topic == "payment_mismatch":
+                claim_ev_refs = list(result.evidence_refs)
+                verdict = "supported" if result.is_payment_mismatch else "unsupported"
                 conf = 0.95
             else:
-                verdict = "supported" if result.suggested_issue == topic else "unsupported"
-                conf = 0.80
+                claim_ev_refs = list(result.evidence_refs)
+                verdict = "unsupported"
+                conf = 0.90
 
             result.claim_assessments.append(
                 {
                     "claim_id": claim_id,
                     "verdict": verdict,
                     "confidence": conf,
-                    "evidence_refs": list(result.evidence_refs),
+                    "evidence_refs": list(dict.fromkeys(claim_ev_refs)),
                 }
             )
 
