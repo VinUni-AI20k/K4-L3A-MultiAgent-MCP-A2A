@@ -21,10 +21,12 @@ Coordinator (adjudicator) sẽ chọn ``primary_issue`` cuối cùng từ các t
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx2
+from mcp.shared.exceptions import MCPError
 
 from ..mcp_gateway import EvidenceGateway
 from ..trace import TraceWriter
@@ -43,9 +45,11 @@ PRIMARY_ISSUES = (
     "insufficient_evidence",
 )
 
-# Lỗi mạng tạm thời — retry được. Lỗi nghiệp vụ (tool trả isError) thì không retry.
-_RETRYABLE = (httpx2.TimeoutException, httpx2.NetworkError, TimeoutError)
-MAX_TOOL_ATTEMPTS = 2
+# Lỗi mạng / giao thức tạm thời (timeout, 502 → MCPError) — retry được.
+# Lỗi nghiệp vụ (tool trả is_error → RuntimeError) thì KHÔNG retry.
+_RETRYABLE = (httpx2.TimeoutException, httpx2.NetworkError, TimeoutError, MCPError)
+MAX_TOOL_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 1.5
 
 
 @dataclass
@@ -113,6 +117,7 @@ async def call_with_retry(
         except _RETRYABLE:
             if attempt == MAX_TOOL_ATTEMPTS:
                 raise
+            await asyncio.sleep(RETRY_BACKOFF_SECONDS * attempt)
     raise AssertionError("unreachable")
 
 

@@ -383,3 +383,25 @@ def test_guard_no_action_means_no_refund_and_drops_foreign_refs() -> None:
     assert out["resolution_actions"] == ["notify customer"]
     assert "refund_without_action" in fixes
     assert enforce_invariants(out, case, ledger)[0] == out  # idempotent
+
+
+def test_transient_mcp_error_is_retried(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mcp.shared.exceptions import MCPError
+
+    from student_agent.agents import base
+
+    monkeypatch.setattr(base, "RETRY_BACKOFF_SECONDS", 0)
+    gateway = FakeGateway()
+    real_call, failures = gateway.call, {"get_policy": 1}
+
+    async def flaky(tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+        if failures.get(tool_name):
+            failures[tool_name] -= 1
+            raise MCPError(code=-32603, message="502 Bad Gateway")
+        return await real_call(tool_name, case_id=case_id, **arguments)
+
+    gateway.call = flaky  # type: ignore[method-assign]
+    trace = TraceWriter(tmp_path / "trace.jsonl", CONTRACTS)
+    out = asyncio.run(solve_case(make_case("unsupported_claim"), gateway, trace))
+    assert out["assessment"]["case_status"] == "no_action"
+    assert out["resolution_actions"] == ["document_no_action"]
