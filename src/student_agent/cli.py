@@ -6,6 +6,7 @@ import json
 import sys
 from pathlib import Path
 
+from .agents.base import TransportLost
 from .cases import load_case_set
 from .config import Settings
 from .contracts import Contracts
@@ -40,24 +41,67 @@ async def _run(root: Path) -> None:
     trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
 
-    async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        discovered_tools = await gateway.list_tools()
-        if not discovered_tools:
-            raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    # The MCP transport can drop mid-run (TLS ConnectError / ReadError / 502). That kills
+    # the whole session, so reconnect and redo ONLY the interrupted case: its partial
+    # trace lines are truncated first, so every case's evidence comes from one session.
+    pending = list(case_set.case_ids)
+    failures = 0
+    while pending:
+        try:
+            async with connect_gateway(
+                settings.mcp_endpoint, settings.team_api_key, contracts
+            ) as gateway:
+                if not await gateway.list_tools():
+                    raise RuntimeError("MCP Gateway returned no tools")
+                while pending:
+                    case_id = pending[0]
+                    mark = trace_path.stat().st_size if trace_path.exists() else 0
+                    try:
+                        await _solve_one(case_set.cases[case_id], gateway, trace, contracts,
+                                         output_root)
+                    except BaseException:
+                        _truncate(trace_path, mark)
+                        raise
+                    pending.pop(0)
+                    failures = 0
+        except (Exception, TransportLost) as exc:  # noqa: BLE001 — connection lost
+            failures += 1
+            if failures > MAX_RECONNECTS:
+                raise
+            print(
+                f"WARN: MCP connection lost at {pending[0]} ({type(exc).__name__}); "
+                f"reconnecting ({failures}/{MAX_RECONNECTS})",
+                file=sys.stderr,
             )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+            await asyncio.sleep(RECONNECT_DELAY_SECONDS * failures)
+
+
+MAX_RECONNECTS = 5
+RECONNECT_DELAY_SECONDS = 5.0
+
+
+def _truncate(path: Path, size: int) -> None:
+    if path.exists() and path.stat().st_size > size:
+        with path.open("r+b") as handle:
+            handle.truncate(size)
+
+
+async def _solve_one(
+    case: dict, gateway: object, trace: TraceWriter, contracts: Contracts, output_root: Path
+) -> None:
+    case_id = case["case_id"]
+    trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+    output = await solve_case(case, gateway, trace)
+    contracts.validate_output(output, f"outputs/{case_id}.json")
+    if output.get("case_id") != case_id:
+        raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+    target = output_root / f"{case_id}.json"
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    temporary.replace(target)
+    trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
 
 
 def parser() -> argparse.ArgumentParser:
