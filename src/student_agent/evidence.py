@@ -36,6 +36,7 @@ _TOKEN_RE = re.compile(r"[^a-z0-9]+")
 # looking up; it never invents an ID that is not present in the case file.
 _ID_KEY_TO_DOMAIN = {
     "order_id": "order",
+    "claimed_order_id": "order",
     "order_ids": "order",
     "order_item_id": "item",
     "item_id": "item",
@@ -85,6 +86,10 @@ def extract_claims(case: dict[str, Any]) -> list[dict[str, Any]]:
     """Return up to 5 claim objects, matching the claimAssessment cap in the schema."""
     claims = case.get("claims")
     if not isinstance(claims, list):
+        customer_request = case.get("customer_request")
+        if isinstance(customer_request, dict):
+            claims = customer_request.get("claims")
+    if not isinstance(claims, list):
         return []
     out = []
     for candidate in claims:
@@ -96,9 +101,28 @@ def extract_claims(case: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def infer_domain(tool_name: str) -> str | None:
-    tokens = set(_TOKEN_RE.split(tool_name.lower()))
+    name = tool_name.lower()
+    if "item" in name:
+        return "item"
+    if "payment" in name:
+        return "payment"
+    if "refund" in name:
+        return "refund"
+    if "shipment" in name:
+        return "shipment"
+    if "seller" in name:
+        return "seller"
+    if "product" in name:
+        return "product"
+    if "customer" in name:
+        return "customer"
+    if "policy" in name:
+        return "policy"
+    if "order" in name:
+        return "order"
+    tokens = set(_TOKEN_RE.split(name))
     for domain in DOMAINS:
-        if domain in tokens:
+        if domain in tokens or f"{domain}s" in tokens:
             return domain
     return None
 

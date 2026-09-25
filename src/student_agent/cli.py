@@ -39,6 +39,20 @@ async def _run(root: Path) -> None:
         stale.unlink()
     trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
+    # Ensure active competition run session exists on the server
+    if settings.mcp_endpoint:
+        base_url = settings.mcp_endpoint.replace("/mcp", "")
+        try:
+            import httpx2
+            async with httpx2.AsyncClient() as client:
+                await client.post(
+                    f"{base_url}/api/v2/runs",
+                    headers={"Authorization": f"Bearer {settings.team_api_key}"},
+                    json={"variant_id": case_set.variant_id},
+                    timeout=10.0,
+                )
+        except Exception:
+            pass
 
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
         discovered_tools = await gateway.list_tools()

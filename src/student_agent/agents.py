@@ -59,6 +59,11 @@ def _get(data: Any, *keys: str) -> Any:
 def _as_number(value: Any) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except (ValueError, TypeError):
+            return None
     return None
 
 
@@ -88,7 +93,15 @@ class SpecialistAgent:
         for domain in self.domains:
             entity_ids = seeds.get(domain, set())
             if not entity_ids:
-                continue
+                order_ids = seeds.get("order", set())
+                domain_tools = tools_by_domain.get(domain, [])
+                if order_ids and any(
+                    "order_id" in d.required_params or "order_id" in d.properties
+                    for d in domain_tools
+                ):
+                    entity_ids = order_ids
+                else:
+                    continue
 
             task = AgentMessage(
                 case_id=case_id,

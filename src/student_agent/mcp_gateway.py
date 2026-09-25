@@ -57,7 +57,7 @@ class EvidenceGateway:
             raise ValueError(f"MCP tool {tool_name}: case_id is required for every call")
         payload = {"case_id": case_id, **arguments}
         result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        if getattr(result, "is_error", False) or getattr(result, "isError", False):
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
