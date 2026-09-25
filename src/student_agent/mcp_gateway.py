@@ -11,6 +11,8 @@ from mcp.client.streamable_http import streamable_http_client
 
 from .contracts import Contracts
 
+CONNECT_RETRIES = 5
+
 
 class EvidenceGateway:
     def __init__(self, session: ClientSession, contracts: Contracts) -> None:
@@ -21,10 +23,24 @@ class EvidenceGateway:
         response = await self._session.list_tools()
         return sorted(tool.name for tool in response.tools)
 
+    async def describe_tools(self) -> list[dict[str, Any]]:
+        response = await self._session.list_tools()
+        return sorted(
+            (
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.input_schema,
+                }
+                for tool in response.tools
+            ),
+            key=lambda tool: tool["name"],
+        )
+
     async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
         result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        if result.is_error:
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
@@ -48,7 +64,13 @@ async def connect_gateway(
     headers = {"Authorization": f"Bearer {team_api_key}"}
     timeout = httpx2.Timeout(300.0, connect=30.0, write=30.0, pool=30.0)
     async with (
-        httpx2.AsyncClient(headers=headers, timeout=timeout) as http_client,
+        httpx2.AsyncClient(
+            headers=headers,
+            timeout=timeout,
+            # Retries only connection setup failures, so no request is ever sent twice and
+            # the whole run stays inside one MCP session.
+            transport=httpx2.AsyncHTTPTransport(retries=CONNECT_RETRIES),
+        ) as http_client,
         streamable_http_client(endpoint, http_client=http_client) as (read_stream, write_stream),
         ClientSession(read_stream, write_stream) as session,
     ):
